@@ -107,6 +107,25 @@ def _extract_json(text: str) -> dict[str, Any]:
     return json.loads(text)
 
 
+def _schema_hint(model_cls: type) -> str:
+    schema = model_cls.model_json_schema()
+    # Drop heavy/internal bits; keep the field contract the model must hit.
+    compact = {
+        "title": schema.get("title") or model_cls.__name__,
+        "required": schema.get("required") or [],
+        "properties": {
+            key: {
+                k: v
+                for k, v in (prop or {}).items()
+                if k in {"type", "description", "enum", "anyOf", "items"}
+            }
+            for key, prop in (schema.get("properties") or {}).items()
+            if key not in {"model_id", "citations"}
+        },
+    }
+    return json.dumps(compact, default=str)
+
+
 def _invoke_structured(role: str, system: str, user: str, model_cls: type):
     settings = get_settings()
     model_ids = settings.model_map()
@@ -115,8 +134,14 @@ def _invoke_structured(role: str, system: str, user: str, model_cls: type):
     if settings.allow_mock_llm or not settings.nous_api_key:
         return _mock_structured(role, user, model_cls), model_id
 
+    schema_hint = _schema_hint(model_cls)
+    system_with_schema = (
+        f"{system}\n\n"
+        f"Reply with ONLY a JSON object matching this schema for {model_cls.__name__}. "
+        f"Do not invent alternate field names.\nSCHEMA: {schema_hint}"
+    )
     llm = get_chat_model(role)
-    messages = [SystemMessage(content=system), HumanMessage(content=user)]
+    messages = [SystemMessage(content=system_with_schema), HumanMessage(content=user)]
     last_error: Exception | None = None
     for _ in range(2):
         try:
@@ -128,8 +153,9 @@ def _invoke_structured(role: str, system: str, user: str, model_cls: type):
             messages.append(
                 HumanMessage(
                     content=(
-                        "Your previous answer was invalid JSON for the schema. "
-                        f"Error: {exc}. Reply with ONLY valid JSON."
+                        f"Your previous answer was invalid for {model_cls.__name__}. "
+                        f"Error: {exc}. "
+                        f"Reply with ONLY valid JSON using exactly these keys/types: {schema_hint}"
                     )
                 )
             )
@@ -297,7 +323,9 @@ def macro_node(state: ICState) -> dict[str, Any]:
         "macro",
         (
             "You are a macro strategist. Use ONLY the provided snapshot. "
-            "Return JSON for MacroReport with regime RISK_ON|RISK_OFF|NEUTRAL."
+            "Return JSON for MacroReport with fields: regime "
+            "(RISK_ON|RISK_OFF|NEUTRAL), vix (number or null), rates_note, "
+            "market_note, implications, summary. No prose outside JSON."
         ),
         json.dumps({"ticker": state["ticker"], "data": data}, default=str),
         MacroReport,
