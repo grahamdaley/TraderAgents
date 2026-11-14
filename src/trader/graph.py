@@ -126,6 +126,65 @@ def _schema_hint(model_cls: type) -> str:
     return json.dumps(compact, default=str)
 
 
+def _first_str(payload: dict[str, Any], keys: tuple[str, ...]) -> str | None:
+    for key in keys:
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def _coerce_structured_payload(
+    model_cls: type, payload: dict[str, Any]
+) -> dict[str, Any]:
+    """Map common model freelancing onto our report contracts."""
+    out = dict(payload)
+    out.pop("report_type", None)
+    # Models often echo the tool citation object; ignore it (we attach ids in-graph).
+    out.pop("citation", None)
+
+    required = set((model_cls.model_json_schema().get("required") or []))
+
+    if "summary" in required and not _first_str(out, ("summary",)):
+        summary = _first_str(
+            out,
+            (
+                "narrative",
+                "rationale",
+                "overview",
+                "thesis",
+                "implications",
+                "market_note",
+            ),
+        )
+        if summary:
+            out["summary"] = summary
+
+    if "narrative" in required and not _first_str(out, ("narrative",)):
+        narrative = _first_str(out, ("summary", "rationale", "overview"))
+        if narrative:
+            out["narrative"] = narrative
+
+    if "implications" in required and not _first_str(out, ("implications",)):
+        implications = _first_str(
+            out, ("implications_for_ticker", "implication", "summary")
+        )
+        if implications:
+            out["implications"] = implications
+
+    if "rates_note" in required and not _first_str(out, ("rates_note",)):
+        rates = _first_str(out, ("rates", "yields_note", "tnx_note"))
+        if rates:
+            out["rates_note"] = rates
+
+    if "market_note" in required and not _first_str(out, ("market_note",)):
+        market = _first_str(out, ("equity_note", "market", "spx_note"))
+        if market:
+            out["market_note"] = market
+
+    return out
+
+
 def _invoke_structured(role: str, system: str, user: str, model_cls: type):
     settings = get_settings()
     model_ids = settings.model_map()
@@ -143,10 +202,12 @@ def _invoke_structured(role: str, system: str, user: str, model_cls: type):
     llm = get_chat_model(role)
     messages = [SystemMessage(content=system_with_schema), HumanMessage(content=user)]
     last_error: Exception | None = None
-    for _ in range(2):
+    for _ in range(3):
         try:
             response = llm.invoke(messages)
             payload = _extract_json(str(response.content))
+            if isinstance(payload, dict):
+                payload = _coerce_structured_payload(model_cls, payload)
             return model_cls.model_validate(payload), model_id
         except (ValidationError, json.JSONDecodeError, TypeError, ValueError) as exc:
             last_error = exc
@@ -296,8 +357,10 @@ def sentiment_node(state: ICState) -> dict[str, Any]:
         "sentiment",
         (
             "You are a market sentiment analyst. Use ONLY the provided headlines. "
-            "Return JSON for SentimentReport with verdict one of "
-            "STRONGLY_BULLISH|BULLISH|NEUTRAL|BEARISH|STRONGLY_BEARISH."
+            "Return JSON for SentimentReport with fields: ticker, narrative, "
+            "verdict (STRONGLY_BULLISH|BULLISH|NEUTRAL|BEARISH|STRONGLY_BEARISH), "
+            "bullish_catalysts, bearish_risks, material_risk_flags, "
+            "confidence (LOW|MEDIUM|HIGH), summary. No prose outside JSON."
         ),
         json.dumps({"ticker": state["ticker"], "data": data}, default=str),
         SentimentReport,
