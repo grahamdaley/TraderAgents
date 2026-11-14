@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 from contextlib import asynccontextmanager
 from typing import Any
@@ -40,13 +41,18 @@ async def lifespan(app: FastAPI):
             logger.error("Nous catalog check failed: %s", exc)
             raise
     try:
-        get_broker()
+        # Connect off the uvicorn loop — IB client owns its own thread/loop.
+        await asyncio.to_thread(get_broker)
     except Exception as exc:  # noqa: BLE001
-        logger.warning("Broker init warning: %s", exc)
+        if settings.allow_mock_broker:
+            logger.warning("Broker init warning: %s", exc)
+        else:
+            logger.error("Broker init failed (ALLOW_MOCK_BROKER=false): %s", exc)
+            raise
     try:
         from trader.graph import get_compiled_graph
 
-        get_compiled_graph()
+        await asyncio.to_thread(get_compiled_graph)
     except Exception as exc:  # noqa: BLE001
         logger.warning("Graph init warning: %s", exc)
     yield

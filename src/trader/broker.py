@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import threading
-from typing import Any
+from collections.abc import Coroutine
+from typing import Any, TypeVar
 
 from trader.config import Settings, get_settings
-from trader.policy import PolicyRejection, revalidate_for_execution
+from trader.policy import revalidate_for_execution
 from trader.schemas import (
     BookSnapshot,
     ExecutionIntent,
@@ -17,6 +19,8 @@ from trader.schemas import (
 )
 
 logger = logging.getLogger(__name__)
+
+T = TypeVar("T")
 
 
 class BrokerError(RuntimeError):
@@ -32,7 +36,12 @@ class PaperAccountRequired(BrokerError):
 
 
 class IBKRAdapter:
-    """IBKR order adapter. Paper by default; live only behind an explicit flag."""
+    """IBKR order adapter. Paper by default; live only behind an explicit flag.
+
+    IB runs on a dedicated thread/event loop so connect works under uvicorn
+    (whose loop is already running). Calls are marshalled via
+    ``asyncio.run_coroutine_threadsafe`` — no nest_asyncio.
+    """
 
     def __init__(self, settings: Settings | None = None):
         self.settings = settings or get_settings()
@@ -41,6 +50,8 @@ class IBKRAdapter:
         self._mock_cash = self.settings.starting_cash
         self._mock_positions: dict[str, float] = {}
         self._mock_orders: list[dict[str, Any]] = []
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._ib_thread: threading.Thread | None = None
 
     @property
     def using_mock(self) -> bool:
@@ -67,41 +78,103 @@ class IBKRAdapter:
 
     def connect(self) -> None:
         self.assert_trading_mode_safe()
+        if self._ib is not None:
+            return
         if self.settings.allow_mock_broker and not self.settings.tws_userid:
             logger.warning("IBKR credentials missing; using mock broker book")
             return
-        try:
-            from ib_async import IB
 
-            ib = IB()
-            ib.connect(
-                self.settings.ibkr_host,
-                self.settings.ibkr_port,
-                clientId=self.settings.ibkr_client_id,
-                readonly=False,
-                timeout=8,
-            )
-            self._ib = ib
-            logger.info(
-                "Connected to IBKR Gateway %s:%s mode=%s",
-                self.settings.ibkr_host,
-                self.settings.ibkr_port,
-                self.settings.ibkr_trading_mode,
-            )
-        except Exception as exc:  # noqa: BLE001
-            if self.settings.allow_mock_broker:
-                logger.warning("IBKR connect failed (%s); using mock broker", exc)
+        ready = threading.Event()
+        errors: list[BaseException] = []
+
+        def runner() -> None:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            self._loop = loop
+            try:
+                from ib_async import IB
+
+                ib = IB()
+
+                async def _connect() -> None:
+                    await ib.connectAsync(
+                        self.settings.ibkr_host,
+                        self.settings.ibkr_port,
+                        clientId=self.settings.ibkr_client_id,
+                        readonly=False,
+                        timeout=8,
+                    )
+
+                loop.run_until_complete(_connect())
+                self._ib = ib
+                logger.info(
+                    "Connected to IBKR Gateway %s:%s mode=%s",
+                    self.settings.ibkr_host,
+                    self.settings.ibkr_port,
+                    self.settings.ibkr_trading_mode,
+                )
+                ready.set()
+                loop.run_forever()
+            except BaseException as exc:  # noqa: BLE001
+                errors.append(exc)
                 self._ib = None
-            else:
-                raise BrokerError(f"IBKR connect failed: {exc}") from exc
+                ready.set()
+            finally:
+                try:
+                    if self._ib is not None:
+                        self._ib.disconnect()
+                except Exception:  # noqa: BLE001
+                    pass
+                self._ib = None
+                if not loop.is_closed():
+                    loop.close()
+                self._loop = None
+
+        self._ib_thread = threading.Thread(
+            target=runner, name="ibkr-client", daemon=True
+        )
+        self._ib_thread.start()
+        if not ready.wait(timeout=30):
+            self.disconnect()
+            raise BrokerError("IBKR connect timed out")
+        if errors:
+            self.disconnect()
+            raise BrokerError(f"IBKR connect failed: {errors[0]}") from errors[0]
 
     def disconnect(self) -> None:
-        if self._ib is not None:
-            try:
-                self._ib.disconnect()
-            except Exception:  # noqa: BLE001
-                pass
-            self._ib = None
+        loop = self._loop
+        thread = self._ib_thread
+        if loop is not None and loop.is_running():
+
+            def _shutdown() -> None:
+                try:
+                    if self._ib is not None:
+                        self._ib.disconnect()
+                except Exception:  # noqa: BLE001
+                    pass
+                self._ib = None
+                loop.stop()
+
+            loop.call_soon_threadsafe(_shutdown)
+            if thread is not None:
+                thread.join(timeout=10)
+        else:
+            if self._ib is not None:
+                try:
+                    self._ib.disconnect()
+                except Exception:  # noqa: BLE001
+                    pass
+                self._ib = None
+        self._ib_thread = None
+        self._loop = None
+
+    def _run_coro(self, coro: Coroutine[Any, Any, T]) -> T:
+        loop = self._loop
+        if self._ib is None or loop is None or not loop.is_running():
+            # Coroutine was created already; close it to avoid "never awaited".
+            coro.close()
+            raise BrokerError("IBKR not connected")
+        return asyncio.run_coroutine_threadsafe(coro, loop).result(timeout=60)
 
     def get_book(self) -> BookSnapshot:
         self.assert_trading_mode_safe()
@@ -120,9 +193,15 @@ class IBKRAdapter:
                 as_of=utcnow(),
                 source="mock",
             )
+        return self._run_coro(self._get_book_async())
 
+    async def _get_book_async(self) -> BookSnapshot:
         ib = self._ib
+        assert ib is not None
         account = self.settings.ibkr_account_id
+        # Run on the IB loop so we touch IB state from the owning thread.
+        pos_rows = await ib.reqPositionsAsync()
+
         cash = 0.0
         buying_power = None
         for av in ib.accountValues(account):
@@ -132,28 +211,28 @@ class IBKRAdapter:
                 buying_power = float(av.value)
 
         positions: list[PositionView] = []
-        for pos in ib.positions(account):
-            symbol = pos.contract.symbol
+        for pos in pos_rows:
+            if account and getattr(pos, "account", None) not in (None, account):
+                continue
             positions.append(
                 PositionView(
-                    ticker=symbol,
+                    ticker=pos.contract.symbol,
                     quantity=float(pos.position),
                     avg_cost=float(pos.avgCost) if pos.avgCost else None,
                     market_value=None,
                 )
             )
 
-        open_orders = []
-        for trade in ib.openTrades():
-            open_orders.append(
-                {
-                    "order_id": trade.order.orderId,
-                    "ticker": trade.contract.symbol,
-                    "side": trade.order.action,
-                    "quantity": trade.order.totalQuantity,
-                    "status": trade.orderStatus.status,
-                }
-            )
+        open_orders = [
+            {
+                "order_id": trade.order.orderId,
+                "ticker": trade.contract.symbol,
+                "side": trade.order.action,
+                "quantity": trade.order.totalQuantity,
+                "status": trade.orderStatus.status,
+            }
+            for trade in ib.openTrades()
+        ]
 
         return BookSnapshot(
             account_id=account or "unknown",
@@ -168,7 +247,6 @@ class IBKRAdapter:
     def get_quote(self, ticker: str) -> float:
         self.assert_trading_mode_safe()
         if self._ib is None:
-            # Fall back to last Yahoo close for mock execution checks.
             from trader.tools.market_data import get_market_data_tools
 
             indicators = get_market_data_tools().compute_indicators(ticker)
@@ -177,11 +255,16 @@ class IBKRAdapter:
                 raise BrokerError(f"No mock quote for {ticker}")
             return float(last)
 
+        return self._run_coro(self._get_quote_async(ticker))
+
+    async def _get_quote_async(self, ticker: str) -> float:
         from ib_async import Stock
 
+        ib = self._ib
+        assert ib is not None
         contract = Stock(ticker.upper(), "SMART", "USD")
-        self._ib.qualifyContracts(contract)
-        tickers = self._ib.reqTickers(contract)
+        await ib.qualifyContractsAsync(contract)
+        tickers = await ib.reqTickersAsync(contract)
         if not tickers:
             raise BrokerError(f"No IBKR quote for {ticker}")
         t = tickers[0]
@@ -212,46 +295,58 @@ class IBKRAdapter:
             if self._ib is None:
                 return self._mock_fill(proposal, intent, live_price)
 
-            from ib_async import LimitOrder, MarketOrder, Stock
-
-            contract = Stock(proposal.ticker.upper(), "SMART", "USD")
-            self._ib.qualifyContracts(contract)
-            action = "BUY" if proposal.side == Side.BUY else "SELL"
-            if proposal.order_type.value == "LIMIT" and proposal.limit_price:
-                order = LimitOrder(action, proposal.quantity, proposal.limit_price)
-            else:
-                order = MarketOrder(action, proposal.quantity)
-            order.orderRef = intent.client_order_id
-            if self.settings.ibkr_account_id:
-                order.account = self.settings.ibkr_account_id
-
-            trade = self._ib.placeOrder(contract, order)
-            # Wait briefly for a fill or acknowledgement in paper.
-            for _ in range(40):
-                self._ib.sleep(0.25)
-                if trade.orderStatus.status in {
-                    "Filled",
-                    "Cancelled",
-                    "Inactive",
-                    "ApiCancelled",
-                }:
-                    break
-
-            status = trade.orderStatus.status
-            if status != "Filled" and trade.orderStatus.filled <= 0:
-                raise BrokerError(f"IBKR order not filled: status={status}")
-
-            fill_price = float(trade.orderStatus.avgFillPrice or live_price)
-            filled_qty = float(trade.orderStatus.filled or proposal.quantity)
-            return FillRecord(
-                intent_id=intent.intent_id,
-                broker_order_id=str(trade.order.orderId),
-                ticker=proposal.ticker.upper(),
-                side=proposal.side,
-                quantity=filled_qty,
-                fill_price=fill_price,
-                account_id=self.settings.ibkr_account_id or book.account_id,
+            return self._run_coro(
+                self._submit_async(proposal, intent, live_price, book)
             )
+
+    async def _submit_async(
+        self,
+        proposal: TradeProposal,
+        intent: ExecutionIntent,
+        live_price: float,
+        book: BookSnapshot,
+    ) -> FillRecord:
+        from ib_async import LimitOrder, MarketOrder, Stock
+
+        ib = self._ib
+        assert ib is not None
+        contract = Stock(proposal.ticker.upper(), "SMART", "USD")
+        await ib.qualifyContractsAsync(contract)
+        action = "BUY" if proposal.side == Side.BUY else "SELL"
+        if proposal.order_type.value == "LIMIT" and proposal.limit_price:
+            order = LimitOrder(action, proposal.quantity, proposal.limit_price)
+        else:
+            order = MarketOrder(action, proposal.quantity)
+        order.orderRef = intent.client_order_id
+        if self.settings.ibkr_account_id:
+            order.account = self.settings.ibkr_account_id
+
+        trade = ib.placeOrder(contract, order)
+        for _ in range(40):
+            await asyncio.sleep(0.25)
+            if trade.orderStatus.status in {
+                "Filled",
+                "Cancelled",
+                "Inactive",
+                "ApiCancelled",
+            }:
+                break
+
+        status = trade.orderStatus.status
+        if status != "Filled" and trade.orderStatus.filled <= 0:
+            raise BrokerError(f"IBKR order not filled: status={status}")
+
+        fill_price = float(trade.orderStatus.avgFillPrice or live_price)
+        filled_qty = float(trade.orderStatus.filled or proposal.quantity)
+        return FillRecord(
+            intent_id=intent.intent_id,
+            broker_order_id=str(trade.order.orderId),
+            ticker=proposal.ticker.upper(),
+            side=proposal.side,
+            quantity=filled_qty,
+            fill_price=fill_price,
+            account_id=self.settings.ibkr_account_id or book.account_id,
+        )
 
     def _mock_fill(
         self, proposal: TradeProposal, intent: ExecutionIntent, live_price: float
@@ -290,11 +385,18 @@ class IBKRAdapter:
 
 
 _adapter: IBKRAdapter | None = None
+_adapter_lock = threading.Lock()
 
 
 def get_broker() -> IBKRAdapter:
     global _adapter
-    if _adapter is None:
-        _adapter = IBKRAdapter()
-        _adapter.connect()
-    return _adapter
+    with _adapter_lock:
+        if _adapter is None:
+            adapter = IBKRAdapter()
+            try:
+                adapter.connect()
+            except Exception:
+                adapter.disconnect()
+                raise
+            _adapter = adapter
+        return _adapter
