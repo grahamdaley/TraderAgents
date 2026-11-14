@@ -1,0 +1,10 @@
+:80 {
+	# For a public VM, put this behind Tailscale or replace with hashed basicauth.
+	handle /api/* {
+		reverse_proxy api:8000
+	}
+
+	handle {
+		reverse_proxy web:80
+	}
+}

@@ -1,0 +1,9 @@
+# Provider-prefixed Nous Portal model IDs.
+# Overridden by environment variables of the same role when set.
+fundamental: anthropic/claude-sonnet-5.5
+technical: anthropic/claude-sonnet-5.5
+sentiment: anthropic/claude-haiku-5.5
+macro: anthropic/claude-sonnet-5.5
+portfolio_manager: anthropic/claude-opus-5.5
+risk: anthropic/claude-opus-5.5
+deep_research: anthropic/claude-fable-5.2
