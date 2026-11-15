@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from typing import Any
 from uuid import uuid4
 
@@ -7,8 +8,25 @@ from sqlalchemy import create_engine, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from trader.config import get_settings
-from trader.db import AuditRow, FillRow, IntentRow, ProposalRow, RunRow
-from trader.schemas import AuditEvent, ExecutionIntent, FillRecord, TradeProposal, utcnow
+from trader.db import (
+    AuditRow,
+    FillRow,
+    IntentRow,
+    PositionPlanRow,
+    ProposalRow,
+    RunRow,
+    ScanCandidateRow,
+    ScanRow,
+)
+from trader.schemas import (
+    AuditEvent,
+    ExecutionIntent,
+    FillRecord,
+    TradeProposal,
+    utcnow,
+)
+
+logger = logging.getLogger(__name__)
 
 
 async def create_run(
@@ -257,6 +275,105 @@ async def add_audit(
     await session.commit()
     await session.refresh(row)
     return row
+
+
+async def save_scan(
+    session: AsyncSession,
+    *,
+    regime: str,
+    universe_count: int,
+    payload: dict[str, Any],
+    candidates: list[dict[str, Any]],
+) -> ScanRow:
+    scan_id = str(uuid4())
+    scan = ScanRow(
+        id=scan_id,
+        regime=regime,
+        universe_count=universe_count,
+        payload=payload,
+    )
+    session.add(scan)
+    for candidate in candidates:
+        session.add(
+            ScanCandidateRow(
+                id=str(uuid4()),
+                scan_id=scan_id,
+                ticker=candidate["ticker"],
+                rank=int(candidate["rank"]),
+                score=float(candidate["score"]),
+                sector=candidate.get("sector") or "",
+                name=candidate.get("name") or "",
+                reason=candidate.get("reason") or "",
+                signals=list(candidate.get("signals") or []),
+                headlines=list(candidate.get("headlines") or []),
+            )
+        )
+    await session.commit()
+    await session.refresh(scan)
+    return scan
+
+
+async def latest_scan(
+    session: AsyncSession,
+) -> tuple[ScanRow, list[ScanCandidateRow]] | None:
+    result = await session.execute(
+        select(ScanRow).order_by(ScanRow.created_at.desc()).limit(1)
+    )
+    scan = result.scalar_one_or_none()
+    if not scan:
+        return None
+    rows = await session.execute(
+        select(ScanCandidateRow)
+        .where(ScanCandidateRow.scan_id == scan.id)
+        .order_by(ScanCandidateRow.rank)
+    )
+    return scan, list(rows.scalars())
+
+
+async def get_open_plan(session: AsyncSession, ticker: str) -> PositionPlanRow | None:
+    result = await session.execute(
+        select(PositionPlanRow)
+        .where(
+            PositionPlanRow.ticker == ticker.upper(),
+            PositionPlanRow.status == "open",
+        )
+        .order_by(PositionPlanRow.opened_at.desc())
+    )
+    rows = list(result.scalars())
+    if not rows:
+        return None
+    if len(rows) > 1:
+        logger.warning(
+            "multiple open plans for %s; keeping newest and closing %s older",
+            ticker.upper(),
+            len(rows) - 1,
+        )
+        for older in rows[1:]:
+            older.status = "closed"
+            older.closed_at = utcnow()
+    return rows[0]
+
+
+async def list_open_plans(session: AsyncSession) -> list[PositionPlanRow]:
+    result = await session.execute(
+        select(PositionPlanRow)
+        .where(PositionPlanRow.status == "open")
+        .order_by(PositionPlanRow.opened_at)
+    )
+    return list(result.scalars())
+
+
+async def exit_review_done(session: AsyncSession, day: str) -> bool:
+    result = await session.execute(
+        select(AuditRow)
+        .where(AuditRow.event_type == "exit_review_completed")
+        .order_by(AuditRow.created_at.desc())
+        .limit(30)
+    )
+    for row in result.scalars():
+        if (row.payload or {}).get("date") == day:
+            return True
+    return False
 
 
 async def list_audit(session: AsyncSession, limit: int = 200) -> list[AuditRow]:

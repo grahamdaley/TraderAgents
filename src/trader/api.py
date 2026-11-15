@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from contextlib import asynccontextmanager
 from typing import Any
 
@@ -10,12 +11,15 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from trader import store
 from trader.broker import get_broker
 from trader.config import get_settings
 from trader.db import get_session_factory, init_db
+from trader.exits import exit_review_loop, review_exits
 from trader.nous import NousCatalogError, verify_configured_models
+from trader.positions import plan_to_dict
+from trader.scanner import load_universe, run_scan
 from trader.schemas import ApprovalRequest
-from trader import store
 from trader.services import get_book_snapshot, resume_with_decision, start_research_run
 
 logger = logging.getLogger(__name__)
@@ -55,7 +59,13 @@ async def lifespan(app: FastAPI):
         await asyncio.to_thread(get_compiled_graph)
     except Exception as exc:  # noqa: BLE001
         logger.warning("Graph init warning: %s", exc)
+    review_task = asyncio.create_task(exit_review_loop())
     yield
+    review_task.cancel()
+    try:
+        await review_task
+    except asyncio.CancelledError:
+        pass
 
 
 app = FastAPI(title="Research Desk", version="0.1.0", lifespan=lifespan)
@@ -94,8 +104,8 @@ async def create_run(
     body: StartRunRequest, session: AsyncSession = Depends(get_session)
 ) -> dict[str, Any]:
     ticker = body.ticker.strip().upper()
-    if not ticker.isalnum():
-        raise HTTPException(400, "ticker must be alphanumeric")
+    if not re.fullmatch(r"[A-Z0-9.\-]+", ticker):
+        raise HTTPException(400, "ticker must be letters, digits, or a class separator")
     try:
         return await start_research_run(session, ticker)
     except Exception as exc:  # noqa: BLE001
@@ -221,6 +231,131 @@ async def fills(session: AsyncSession = Depends(get_session)) -> list[dict[str, 
         }
         for r in rows
     ]
+
+
+def _candidate_out(row: Any) -> dict[str, Any]:
+    if isinstance(row, dict):
+        return {
+            "ticker": row.get("ticker"),
+            "rank": row.get("rank"),
+            "score": row.get("score"),
+            "sector": row.get("sector") or "",
+            "name": row.get("name") or "",
+            "reason": row.get("reason") or "",
+            "signals": list(row.get("signals") or []),
+            "headlines": list(row.get("headlines") or []),
+        }
+    return {
+        "ticker": row.ticker,
+        "rank": row.rank,
+        "score": row.score,
+        "sector": row.sector,
+        "name": row.name,
+        "reason": row.reason,
+        "signals": list(row.signals or []),
+        "headlines": list(row.headlines or []),
+    }
+
+
+async def _hold_tickers(session: AsyncSession) -> set[str]:
+    rows = await store.list_runs(session, limit=40)
+    found: set[str] = set()
+    for row in rows:
+        thesis = (row.state_snapshot or {}).get("pm_thesis") or {}
+        if thesis.get("side") == "HOLD":
+            found.add(row.ticker.upper())
+    return found
+
+
+@app.post("/api/scans")
+async def create_scan(session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
+    try:
+        universe = load_universe()
+    except (FileNotFoundError, ValueError) as exc:
+        raise HTTPException(400, str(exc)) from exc
+    held: set[str] = set()
+    try:
+        book = get_book_snapshot()
+        held = {p.ticker.upper() for p in book.positions if p.quantity > 0}
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("scan continuing without book: %s", exc)
+    holds = await _hold_tickers(session)
+    try:
+        result = await asyncio.to_thread(
+            run_scan,
+            universe=universe,
+            held_tickers=held,
+            hold_tickers=holds,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("scan failed")
+        raise HTTPException(500, str(exc)) from exc
+    scan = await store.save_scan(
+        session,
+        regime=result["regime"],
+        universe_count=result["universe_count"],
+        payload={"hot_sectors": result.get("hot_sectors") or []},
+        candidates=result["candidates"],
+    )
+    return {
+        "id": scan.id,
+        "regime": scan.regime,
+        "universe_count": scan.universe_count,
+        "hot_sectors": result.get("hot_sectors") or [],
+        "created_at": scan.created_at,
+        "candidates": [_candidate_out(row) for row in result["candidates"]],
+    }
+
+
+@app.get("/api/scans/latest")
+async def latest_scan(session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
+    found = await store.latest_scan(session)
+    if not found:
+        return {"id": None, "candidates": []}
+    scan, rows = found
+    return {
+        "id": scan.id,
+        "regime": scan.regime,
+        "universe_count": scan.universe_count,
+        "hot_sectors": (scan.payload or {}).get("hot_sectors") or [],
+        "created_at": scan.created_at,
+        "candidates": [_candidate_out(row) for row in rows],
+    }
+
+
+@app.get("/api/position-plans")
+async def position_plans(session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
+    plans = await store.list_open_plans(session)
+    planned = {row.ticker.upper() for row in plans}
+    unplanned: list[dict[str, Any]] = []
+    book_error = None
+    try:
+        book = get_book_snapshot()
+        unplanned = [
+            {
+                "ticker": pos.ticker,
+                "quantity": pos.quantity,
+                "avg_cost": pos.avg_cost,
+            }
+            for pos in book.positions
+            if pos.quantity > 0 and pos.ticker.upper() not in planned
+        ]
+    except Exception as exc:  # noqa: BLE001
+        book_error = str(exc)
+    return {
+        "plans": [plan_to_dict(row) for row in plans],
+        "unplanned": unplanned,
+        "book_error": book_error,
+    }
+
+
+@app.post("/api/exits/review")
+async def exits_review(session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
+    try:
+        return await review_exits(session, scheduled=False)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("exit review failed")
+        raise HTTPException(500, str(exc)) from exc
 
 
 @app.get("/api/audit")

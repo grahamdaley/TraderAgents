@@ -5,8 +5,8 @@ from datetime import timedelta
 from trader.config import Settings, get_settings
 from trader.schemas import (
     BookSnapshot,
-    PolicyCheck,
     PmThesis,
+    PolicyCheck,
     RiskNarrative,
     Side,
     TradeProposal,
@@ -154,12 +154,14 @@ def build_trade_proposal(
                 )
             )
             raise PolicyRejection("SELL requires an existing long position", checks)
-        quantity = min(quantity, current_qty)
+        quantity = current_qty
+        if nav > 0:
+            size_pct = min(1.0, (current_qty * reference_price) / nav)
         checks.append(
             PolicyCheck(
                 name="sell_requires_long",
                 passed=True,
-                detail=f"Flattening up to {quantity} of {current_qty} shares",
+                detail=f"Flattening {quantity} shares",
             )
         )
 
@@ -274,5 +276,45 @@ def revalidate_for_execution(
                     )
                 ],
             )
+        checks.append(
+            PolicyCheck(
+                name="cash_check",
+                passed=True,
+                detail=f"Cash {book.cash:.2f} covers notional {notional:.2f}",
+            )
+        )
+    elif proposal.side == Side.SELL:
+        current_qty = _position_qty(book, proposal.ticker)
+        if current_qty <= 0:
+            raise PolicyRejection(
+                "SELL requires an existing long position",
+                [
+                    PolicyCheck(
+                        name="sell_requires_long",
+                        passed=False,
+                        detail="No long position at execution",
+                    )
+                ],
+            )
+        if proposal.quantity > current_qty:
+            raise PolicyRejection(
+                "SELL quantity exceeds the live long",
+                [
+                    PolicyCheck(
+                        name="sell_requires_long",
+                        passed=False,
+                        detail=(
+                            f"Requested {proposal.quantity} exceeds long {current_qty}"
+                        ),
+                    )
+                ],
+            )
+        checks.append(
+            PolicyCheck(
+                name="sell_requires_long",
+                passed=True,
+                detail=f"Long {current_qty} covers sell {proposal.quantity}",
+            )
+        )
 
     return checks

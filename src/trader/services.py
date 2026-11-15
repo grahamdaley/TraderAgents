@@ -8,8 +8,10 @@ from uuid import uuid4
 from langgraph.types import Command
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from trader import store
 from trader.broker import get_broker
 from trader.graph import get_compiled_graph, initial_state, invoke_graph_locked
+from trader.positions import postpone_plan, record_fill_on_plan
 from trader.schemas import (
     ApprovalRequest,
     ExecutionIntent,
@@ -17,7 +19,6 @@ from trader.schemas import (
     RunStatus,
     TradeProposal,
 )
-from trader import store
 
 logger = logging.getLogger(__name__)
 
@@ -32,10 +33,23 @@ def _serialize_state(values: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
-async def start_research_run(session: AsyncSession, ticker: str) -> dict[str, Any]:
+async def start_research_run(
+    session: AsyncSession,
+    ticker: str,
+    *,
+    run_kind: str = "research",
+    position_context: dict[str, Any] | None = None,
+    exit_reason: str | None = None,
+) -> dict[str, Any]:
     run_id = str(uuid4())
     thread_id = run_id
-    state = initial_state(run_id, ticker)
+    state = initial_state(
+        run_id,
+        ticker,
+        run_kind=run_kind,
+        position_context=position_context,
+        exit_reason=exit_reason,
+    )
     await store.create_run(
         session,
         run_id=run_id,
@@ -47,7 +61,7 @@ async def start_research_run(session: AsyncSession, ticker: str) -> dict[str, An
         session,
         event_type="run_started",
         run_id=run_id,
-        payload={"ticker": ticker.upper()},
+        payload={"ticker": ticker.upper(), "run_kind": run_kind},
     )
 
     graph = get_compiled_graph()
@@ -75,6 +89,7 @@ async def start_research_run(session: AsyncSession, ticker: str) -> dict[str, An
         raise
 
     values = _serialize_state(snapshot.values if snapshot else result)
+    values.setdefault("run_id", run_id)
     interrupted = bool(snapshot and snapshot.next) or (
         bool(values.get("trade_proposal"))
         and values.get("status") == RunStatus.AWAITING_HUMAN.value
@@ -113,6 +128,16 @@ async def start_research_run(session: AsyncSession, ticker: str) -> dict[str, An
                 "content_hash": proposal.content_hash,
             },
         )
+
+    if run_kind == "horizon_review":
+        thesis = values.get("pm_thesis") or {}
+        if thesis.get("side") == "HOLD":
+            await postpone_plan(
+                session,
+                ticker.upper(),
+                int(thesis.get("horizon_days") or 30),
+                str(thesis.get("thesis") or ""),
+            )
 
     return {
         "run_id": run_id,
@@ -171,6 +196,7 @@ async def resume_with_decision(
         raise
 
     values = _serialize_state(snapshot.values if snapshot else result)
+    values.setdefault("run_id", run_id)
     status = values.get("status") or RunStatus.REJECTED.value
     await store.update_run(
         session,
@@ -208,6 +234,7 @@ async def resume_with_decision(
                 "account_id": fill_rec.account_id,
             },
         )
+        await record_fill_on_plan(session, values)
 
     # Audit the human decision only after resume completed successfully.
     await store.add_audit(

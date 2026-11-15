@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import DateTime, Float, String, Text, func
+from sqlalchemy import DateTime, Float, Integer, String, Text, func
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
@@ -78,6 +78,58 @@ class FillRow(Base):
     payload: Mapped[dict[str, Any]] = mapped_column(JSONB, default=dict)
     filled_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
+    )
+
+
+class ScanRow(Base):
+    __tablename__ = "scans"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    regime: Mapped[str] = mapped_column(String(16))
+    universe_count: Mapped[int] = mapped_column(Integer)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSONB, default=dict)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+
+class ScanCandidateRow(Base):
+    __tablename__ = "scan_candidates"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    scan_id: Mapped[str] = mapped_column(String(64), index=True)
+    ticker: Mapped[str] = mapped_column(String(32), index=True)
+    rank: Mapped[int] = mapped_column(Integer)
+    score: Mapped[float] = mapped_column(Float)
+    sector: Mapped[str] = mapped_column(String(16), default="")
+    name: Mapped[str] = mapped_column(String(128), default="")
+    reason: Mapped[str] = mapped_column(Text, default="")
+    signals: Mapped[list[Any]] = mapped_column(JSONB, default=list)
+    headlines: Mapped[list[Any]] = mapped_column(JSONB, default=list)
+
+
+class PositionPlanRow(Base):
+    __tablename__ = "position_plans"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    ticker: Mapped[str] = mapped_column(String(32), index=True)
+    run_id: Mapped[str] = mapped_column(String(64), default="")
+    quantity: Mapped[float] = mapped_column(Float)
+    avg_price: Mapped[float] = mapped_column(Float)
+    horizon_days: Mapped[int] = mapped_column(Integer)
+    review_after: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    entry_sma50: Mapped[float | None] = mapped_column(Float, nullable=True)
+    thesis_summary: Mapped[str] = mapped_column(Text, default="")
+    status: Mapped[str] = mapped_column(String(16), index=True, default="open")
+    opened_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    closed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_close: Mapped[float | None] = mapped_column(Float, nullable=True)
+    last_sma50: Mapped[float | None] = mapped_column(Float, nullable=True)
+    nearest_rule: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    last_checked_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
     )
 
 

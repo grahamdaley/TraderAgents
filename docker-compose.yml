@@ -29,13 +29,13 @@ services:
       # gnzsnz maps paper API to 4004 inside the published port mapping convention
       - "4004:4004"
       - "5900:5900"
-    profiles:
-      - ibkr
 
   api:
     build:
       context: .
       dockerfile: Dockerfile
+    # Reload so volume-mounted src/ changes apply without a manual recreate.
+    command: ["uvicorn", "trader.api:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
     env_file:
       - .env
     environment:
@@ -48,6 +48,8 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      ib-gateway:
+        condition: service_started
     volumes:
       - ./src:/app/src
       - ./config:/app/config

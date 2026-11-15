@@ -59,6 +59,9 @@ class Settings(BaseSettings):
     max_position_pct: float = Field(default=0.10, alias="MAX_POSITION_PCT")
     price_band_pct: float = Field(default=0.02, alias="PRICE_BAND_PCT")
     proposal_ttl_minutes: int = Field(default=30, alias="PROPOSAL_TTL_MINUTES")
+    exit_max_loss_pct: float = Field(default=0.08, alias="EXIT_MAX_LOSS_PCT")
+    exit_review_hour_utc: int = Field(default=21, alias="EXIT_REVIEW_HOUR_UTC")
+    horizon_review_cap: int = Field(default=3, alias="HORIZON_REVIEW_CAP")
     starting_cash: float = Field(default=100_000.0, alias="STARTING_CASH")
     restricted_tickers: str = Field(default="", alias="RESTRICTED_TICKERS")
 
@@ -69,7 +72,7 @@ class Settings(BaseSettings):
         default=False, alias="SKIP_NOUS_CATALOG_CHECK"
     )
     allow_mock_llm: bool = Field(default=False, alias="ALLOW_MOCK_LLM")
-    allow_mock_broker: bool = Field(default=True, alias="ALLOW_MOCK_BROKER")
+    allow_mock_broker: bool = Field(default=False, alias="ALLOW_MOCK_BROKER")
 
     @field_validator("ibkr_live_orders_enabled", mode="before")
     @classmethod

@@ -12,35 +12,30 @@ LangGraph investment committee that researches US equities, pauses for human app
 
 ## Quick start
 
-1. Copy `.env.example` to `.env` and set `NOUS_API_KEY`. IBKR credentials are optional until you enable the `ibkr` Compose profile.
-2. Install and run the API locally (Postgres via Compose):
-
-```bash
-docker compose up -d postgres
-python -m venv .venv && source .venv/bin/activate
-pip install -e ".[dev]"
-uvicorn trader.api:app --reload --app-dir src
-```
-
-3. Operator console:
-
-```bash
-cd web && npm install && npm run dev
-```
-
-4. Full stack (without IB Gateway):
+1. Copy `.env.example` to `.env` and set `NOUS_API_KEY`, `TWS_USERID`, `TWS_PASSWORD`, and `IBKR_ACCOUNT_ID=DU…`.
+2. Full stack (API, web, Postgres, IB Gateway paper):
 
 ```bash
 docker compose up --build
 ```
 
-5. With IB Gateway paper (requires IBKR username/password in `.env`):
+3. Or run the API locally against Compose Postgres + Gateway:
 
 ```bash
-docker compose --profile ibkr up --build
+docker compose up -d postgres ib-gateway
+python -m venv .venv && source .venv/bin/activate
+pip install -e ".[dev]"
+# Point IBKR_HOST=127.0.0.1 when the API runs on the host
+uvicorn trader.api:app --reload --app-dir src
 ```
 
-Open the console at `http://localhost:5173` (dev) or `http://localhost:8080` (Caddy).
+4. Operator console (dev):
+
+```bash
+cd web && npm install && npm run dev
+```
+
+Open the console at `http://localhost:5173` (dev) or `http://localhost:8080` (Caddy). `docker compose down` stops Gateway with the rest of the stack.
 
 ## Safety
 

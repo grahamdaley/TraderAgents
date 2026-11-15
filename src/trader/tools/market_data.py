@@ -22,6 +22,39 @@ def _safe_float(value: Any) -> float | None:
         return None
 
 
+def indicators_from_closes(closes: pd.Series) -> dict[str, float | None]:
+    """SMA, RSI, volatility, and trailing returns from a close series.
+
+    Shared by the single-name technical node and the market scanner.
+    """
+    closes = closes.dropna()
+    if closes.empty:
+        return {}
+    sma20 = closes.rolling(20).mean().iloc[-1] if len(closes) >= 20 else None
+    sma50 = closes.rolling(50).mean().iloc[-1] if len(closes) >= 50 else None
+    delta = closes.diff()
+    gain = delta.clip(lower=0).rolling(14).mean()
+    loss = (-delta.clip(upper=0)).rolling(14).mean()
+    rs = gain / loss.replace(0, pd.NA)
+    rsi = 100 - (100 / (1 + rs))
+    ret = closes.pct_change().dropna()
+    vol = float(ret.tail(20).std() * (252**0.5)) if len(ret) >= 20 else None
+    last = float(closes.iloc[-1])
+    return {
+        "last_close": last,
+        "sma20": _safe_float(sma20),
+        "sma50": _safe_float(sma50),
+        "rsi14": _safe_float(rsi.iloc[-1]) if len(closes) >= 15 else None,
+        "realized_vol_20d": vol,
+        "return_1m": _safe_float(closes.iloc[-1] / closes.iloc[-21] - 1)
+        if len(closes) >= 21
+        else None,
+        "return_3m": _safe_float(closes.iloc[-1] / closes.iloc[-63] - 1)
+        if len(closes) >= 63
+        else None,
+    }
+
+
 class MarketDataTools:
     """Yahoo Finance research tools. Execution quotes come from IBKR."""
 
@@ -63,29 +96,7 @@ class MarketDataTools:
                 "error": "insufficient history",
             }
         closes = pd.Series([b["close"] for b in bars if b.get("close") is not None])
-        sma20 = closes.rolling(20).mean().iloc[-1]
-        sma50 = closes.rolling(50).mean().iloc[-1] if len(closes) >= 50 else None
-        delta = closes.diff()
-        gain = delta.clip(lower=0).rolling(14).mean()
-        loss = (-delta.clip(upper=0)).rolling(14).mean()
-        rs = gain / loss.replace(0, pd.NA)
-        rsi = 100 - (100 / (1 + rs))
-        ret = closes.pct_change().dropna()
-        vol = float(ret.tail(20).std() * (252**0.5)) if len(ret) >= 20 else None
-        last = float(closes.iloc[-1])
-        indicators = {
-            "last_close": last,
-            "sma20": _safe_float(sma20),
-            "sma50": _safe_float(sma50),
-            "rsi14": _safe_float(rsi.iloc[-1]),
-            "realized_vol_20d": vol,
-            "return_1m": _safe_float(closes.iloc[-1] / closes.iloc[-21] - 1)
-            if len(closes) >= 21
-            else None,
-            "return_3m": _safe_float(closes.iloc[-1] / closes.iloc[-63] - 1)
-            if len(closes) >= 63
-            else None,
-        }
+        indicators = indicators_from_closes(closes)
         return {
             "ticker": ticker.upper(),
             "indicators": indicators,

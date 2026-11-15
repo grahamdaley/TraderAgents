@@ -19,7 +19,6 @@ from trader.broker import get_broker
 from trader.config import get_settings
 from trader.nous import get_chat_model
 from trader.policy import PolicyRejection, build_trade_proposal
-from trader.store import list_open_proposal_tickers_sync
 from trader.schemas import (
     FundamentalsReport,
     MacroReport,
@@ -33,6 +32,7 @@ from trader.schemas import (
     TechnicalsReport,
     TradeProposal,
 )
+from trader.store import list_open_proposal_tickers_sync
 from trader.tools.market_data import get_market_data_tools
 
 logger = logging.getLogger(__name__)
@@ -63,6 +63,9 @@ class ICState(TypedDict, total=False):
     citation_ids: Annotated[list[str], operator.add]
     error: str | None
     status: str
+    run_kind: str
+    position_context: dict[str, Any] | None
+    exit_reason: str | None
 
 
 def _node_update(
@@ -143,7 +146,9 @@ def _coerce_structured_payload(
     # Models often echo the tool citation object; ignore it (we attach ids in-graph).
     out.pop("citation", None)
 
-    required = set((model_cls.model_json_schema().get("required") or []))
+    schema = model_cls.model_json_schema()
+    required = set(schema.get("required") or [])
+    properties = schema.get("properties") or {}
 
     if "summary" in required and not _first_str(out, ("summary",)):
         summary = _first_str(
@@ -181,6 +186,29 @@ def _coerce_structured_payload(
         market = _first_str(out, ("equity_note", "market", "spx_note"))
         if market:
             out["market_note"] = market
+
+    # Last resort: fill any still-missing required strings so a useful but
+    # imperfect model reply does not abort the whole IC run.
+    fallback_bits = [
+        v.strip()
+        for v in (
+            out.get("summary"),
+            out.get("narrative"),
+            out.get("rationale"),
+            str(out.get("verdict") or ""),
+            str(out.get("regime") or ""),
+            str(out.get("ticker") or ""),
+        )
+        if isinstance(v, str) and v.strip()
+    ]
+    fallback = " | ".join(fallback_bits[:3]) or "Model omitted this field"
+    for key in required:
+        prop = properties.get(key) or {}
+        if prop.get("type") != "string":
+            continue
+        if _first_str(out, (key,)):
+            continue
+        out[key] = fallback
 
     return out
 
@@ -406,26 +434,38 @@ def macro_node(state: ICState) -> dict[str, Any]:
 
 def pm_node(state: ICState) -> dict[str, Any]:
     nodes = _mark(state.get("nodes", {}), "portfolio_manager", NodeStatus.RUNNING)
+    horizon_review = state.get("run_kind") == "horizon_review"
     packet = {
         "ticker": state["ticker"],
         "fundamentals": state.get("fundamentals_report"),
         "technicals": state.get("technicals_report"),
         "sentiment": state.get("sentiment_report"),
         "macro": state.get("macro_report"),
+        "position": state.get("position_context"),
     }
+    instructions = (
+        "You are the portfolio manager. Synthesize the four specialist reports. "
+        "Return JSON for PmThesis: ticker, side (BUY|SELL|HOLD), conviction "
+        "(LOW|MEDIUM|HIGH), horizon_days, size_pct_nav (0-1, suggest <=0.1), "
+        "thesis, key_risks, disagreements. Long/flat only — SELL means flatten."
+    )
+    if horizon_review:
+        instructions += (
+            " This is a horizon review of an existing long, described in position. "
+            "Choose SELL to flatten or HOLD to extend. Do not return BUY."
+        )
     thesis, model_id = _invoke_structured(
         "portfolio_manager",
-        (
-            "You are the portfolio manager. Synthesize the four specialist reports. "
-            "Return JSON for PmThesis: ticker, side (BUY|SELL|HOLD), conviction "
-            "(LOW|MEDIUM|HIGH), horizon_days, size_pct_nav (0-1, suggest <=0.1), "
-            "thesis, key_risks, disagreements. Long/flat only — SELL means flatten."
-        ),
+        instructions,
         json.dumps(packet, default=str),
         PmThesis,
     )
     thesis.model_id = model_id
     thesis.ticker = state["ticker"].upper()
+    if horizon_review and thesis.side == Side.BUY:
+        thesis.side = Side.HOLD
+        thesis.size_pct_nav = 0
+        thesis.thesis = f"{thesis.thesis} (horizon review kept the position flat)"
     nodes = _mark(nodes, "portfolio_manager", NodeStatus.DONE)
     return {
         "nodes": nodes,
@@ -543,6 +583,27 @@ def execute_node(state: ICState) -> dict[str, Any]:
             proposal.quantity = float(decision["quantity"])
         if decision.get("limit_price") is not None:
             proposal.limit_price = float(decision["limit_price"])
+        # SELL stays at or under the live long; oversized edits are clamped.
+        if proposal.side == Side.SELL:
+            book = get_broker().get_book()
+            live_qty = 0.0
+            for pos in book.positions:
+                if pos.ticker.upper() == proposal.ticker.upper():
+                    live_qty = float(pos.quantity)
+                    break
+            if live_qty <= 0:
+                nodes = _mark(
+                    nodes,
+                    "execute",
+                    NodeStatus.FAILED,
+                    error="SELL requires an existing long position",
+                )
+                return {
+                    "nodes": nodes,
+                    "error": "SELL requires an existing long position",
+                    "status": RunStatus.FAILED.value,
+                }
+            proposal.quantity = min(proposal.quantity, live_qty)
         proposal = proposal.with_hash()
 
     from trader.schemas import ExecutionIntent
@@ -581,6 +642,58 @@ def execute_node(state: ICState) -> dict[str, Any]:
         }
 
 
+def begin_node(state: ICState) -> dict[str, Any]:
+    return {}
+
+
+def fanout_node(state: ICState) -> dict[str, Any]:
+    return {}
+
+
+def route_after_begin(state: ICState) -> str:
+    if state.get("run_kind") == "exit_rule":
+        return "exit_thesis"
+    return "fanout"
+
+
+def exit_thesis_node(state: ICState) -> dict[str, Any]:
+    """Deterministic flatten. Skips the committee and still enters policy."""
+    ticker = state["ticker"].upper()
+    reason = state.get("exit_reason") or "Exit rule fired. Flatten the long."
+    thesis = PmThesis(
+        ticker=ticker,
+        side=Side.SELL,
+        conviction="HIGH",
+        horizon_days=14,
+        size_pct_nav=1.0,
+        thesis=reason,
+        key_risks=["rule_exit"],
+    )
+    risk = RiskNarrative(
+        ticker=ticker,
+        narrative=reason,
+        flags=["exit_rule"],
+        recommend_proceed=True,
+    )
+    nodes = state.get("nodes") or {}
+    skipped: dict[str, Any] = {}
+    for name in (
+        "fundamental",
+        "technical",
+        "sentiment",
+        "macro",
+        "portfolio_manager",
+        "risk",
+    ):
+        skipped.update(_mark(nodes, name, NodeStatus.SKIPPED))
+    return {
+        "nodes": skipped,
+        "pm_thesis": thesis.model_dump(mode="json"),
+        "risk_narrative": risk.model_dump(mode="json"),
+        "model_ids": {},
+    }
+
+
 def route_after_policy(state: ICState) -> str:
     if state.get("trade_proposal"):
         return "human_gate"
@@ -596,6 +709,9 @@ def route_after_human(state: ICState) -> str:
 
 def build_graph(checkpointer=None):
     graph = StateGraph(ICState)
+    graph.add_node("begin", begin_node)
+    graph.add_node("fanout", fanout_node)
+    graph.add_node("exit_thesis", exit_thesis_node)
     graph.add_node("fundamental", fundamental_node)
     graph.add_node("technical", technical_node)
     graph.add_node("sentiment", sentiment_node)
@@ -607,10 +723,13 @@ def build_graph(checkpointer=None):
     graph.add_node("human_gate", human_gate_node)
     graph.add_node("execute", execute_node)
 
-    graph.add_edge(START, "fundamental")
-    graph.add_edge(START, "technical")
-    graph.add_edge(START, "sentiment")
-    graph.add_edge(START, "macro")
+    graph.add_edge(START, "begin")
+    graph.add_conditional_edges("begin", route_after_begin, ["fanout", "exit_thesis"])
+    graph.add_edge("fanout", "fundamental")
+    graph.add_edge("fanout", "technical")
+    graph.add_edge("fanout", "sentiment")
+    graph.add_edge("fanout", "macro")
+    graph.add_edge("exit_thesis", "policy")
     graph.add_edge("fundamental", "portfolio_manager")
     graph.add_edge("technical", "portfolio_manager")
     graph.add_edge("sentiment", "portfolio_manager")
@@ -670,7 +789,14 @@ def invoke_graph_locked(graph, payload, config) -> tuple[dict[str, Any], Any, Ex
         return result, snapshot, interrupt_exc
 
 
-def initial_state(run_id: str, ticker: str) -> ICState:
+def initial_state(
+    run_id: str,
+    ticker: str,
+    *,
+    run_kind: str = "research",
+    position_context: dict[str, Any] | None = None,
+    exit_reason: str | None = None,
+) -> ICState:
     node_names = [
         "fundamental",
         "technical",
@@ -703,4 +829,7 @@ def initial_state(run_id: str, ticker: str) -> ICState:
         "citation_ids": [],
         "error": None,
         "status": RunStatus.RUNNING.value,
+        "run_kind": run_kind,
+        "position_context": position_context,
+        "exit_reason": exit_reason,
     }

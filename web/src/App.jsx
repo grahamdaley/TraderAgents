@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useState } from "react";
 
-const TABS = ["Runs", "Inbox", "Book", "Audit"];
+const TABS = ["Runs", "Scan", "Inbox", "Book", "Audit"];
 
 async function api(path, options = {}) {
   const res = await fetch(path, {
@@ -24,6 +24,14 @@ function Badge({ status }) {
   return <span className={`badge ${status || ""}`}>{status || "—"}</span>;
 }
 
+function explain(error) {
+  const message = String(error?.message || error || "");
+  if (message === "Failed to fetch") {
+    return "The API is not reachable.";
+  }
+  return message;
+}
+
 function RunsPanel({ onSelectRun }) {
   const [ticker, setTicker] = useState("AAPL");
   const [runs, setRuns] = useState([]);
@@ -34,11 +42,14 @@ function RunsPanel({ onSelectRun }) {
   const refresh = useCallback(async () => {
     const data = await api("/api/runs");
     setRuns(data);
+    setError("");
   }, []);
 
   useEffect(() => {
-    refresh().catch((e) => setError(String(e.message || e)));
-    const id = setInterval(() => refresh().catch(() => {}), 4000);
+    refresh().catch((e) => setError(explain(e)));
+    const id = setInterval(() => {
+      refresh().catch((e) => setError(explain(e)));
+    }, 4000);
     return () => clearInterval(id);
   }, [refresh]);
 
@@ -62,9 +73,14 @@ function RunsPanel({ onSelectRun }) {
   }
 
   async function openRun(id) {
-    const detail = await api(`/api/runs/${id}`);
-    setSelected(detail);
-    onSelectRun?.(detail);
+    setError("");
+    try {
+      const detail = await api(`/api/runs/${id}`);
+      setSelected(detail);
+      onSelectRun?.(detail);
+    } catch (e) {
+      setError(explain(e));
+    }
   }
 
   const nodes = selected?.nodes || {};
@@ -151,6 +167,114 @@ function RunsPanel({ onSelectRun }) {
           </>
         )}
       </div>
+    </div>
+  );
+}
+
+function ScanPanel({ onStarted }) {
+  const [scan, setScan] = useState(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const [starting, setStarting] = useState("");
+
+  const refresh = useCallback(async () => {
+    setScan(await api("/api/scans/latest"));
+  }, []);
+
+  useEffect(() => {
+    refresh().catch((e) => setError(String(e.message || e)));
+  }, [refresh]);
+
+  async function runScan() {
+    setBusy(true);
+    setError("");
+    try {
+      setScan(await api("/api/scans", { method: "POST" }));
+    } catch (e) {
+      setError(String(e.message || e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function research(ticker) {
+    setStarting(ticker);
+    setError("");
+    try {
+      await api("/api/runs", {
+        method: "POST",
+        body: JSON.stringify({ ticker }),
+      });
+      onStarted?.();
+    } catch (e) {
+      setError(String(e.message || e));
+    } finally {
+      setStarting("");
+    }
+  }
+
+  const candidates = scan?.candidates || [];
+
+  return (
+    <div className="panel">
+      <div className="row" style={{ justifyContent: "space-between", marginBottom: 12 }}>
+        <div>
+          <h3 style={{ margin: 0 }}>Scan</h3>
+          <p className="muted" style={{ margin: "4px 0 0" }}>
+            {scan?.id
+              ? `${scan.regime || "—"} · ${scan.universe_count || 0} names · ${
+                  scan.created_at ? new Date(scan.created_at).toLocaleString() : ""
+                }`
+              : "No scan yet."}
+            {scan?.hot_sectors?.length ? ` · leading ${scan.hot_sectors.join(", ")}` : ""}
+          </p>
+        </div>
+        <button className="btn" disabled={busy} onClick={runScan}>
+          {busy ? "Scanning…" : "Run scan"}
+        </button>
+      </div>
+      {error ? <div className="error">{error}</div> : null}
+      <table className="table">
+        <thead>
+          <tr>
+            <th>#</th>
+            <th>Ticker</th>
+            <th>Sector</th>
+            <th>Score</th>
+            <th>Signals</th>
+            <th>Why</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody>
+          {candidates.map((row) => (
+            <tr key={`${row.ticker}-${row.rank}`}>
+              <td>{row.rank}</td>
+              <td>{row.ticker}</td>
+              <td className="muted">{row.sector}</td>
+              <td>{row.score}</td>
+              <td className="muted">{(row.signals || []).join(", ")}</td>
+              <td>{row.reason}</td>
+              <td>
+                <button
+                  className="btn secondary"
+                  disabled={starting === row.ticker}
+                  onClick={() => research(row.ticker)}
+                >
+                  {starting === row.ticker ? "Starting…" : "Research"}
+                </button>
+              </td>
+            </tr>
+          ))}
+          {!candidates.length ? (
+            <tr>
+              <td colSpan={7} className="muted">
+                Run a scan to rank the universe. Research sends one name to the committee.
+              </td>
+            </tr>
+          ) : null}
+        </tbody>
+      </table>
     </div>
   );
 }
@@ -312,12 +436,20 @@ function InboxPanel() {
 function BookPanel() {
   const [book, setBook] = useState(null);
   const [fills, setFills] = useState([]);
+  const [plans, setPlans] = useState({ plans: [], unplanned: [] });
   const [error, setError] = useState("");
+  const [reviewNote, setReviewNote] = useState("");
+  const [reviewing, setReviewing] = useState(false);
 
   const refresh = useCallback(async () => {
-    const [b, f] = await Promise.all([api("/api/book"), api("/api/fills")]);
+    const [b, f, p] = await Promise.all([
+      api("/api/book"),
+      api("/api/fills"),
+      api("/api/position-plans"),
+    ]);
     setBook(b);
     setFills(f);
+    setPlans(p);
   }, []);
 
   useEffect(() => {
@@ -326,8 +458,83 @@ function BookPanel() {
     return () => clearInterval(id);
   }, [refresh]);
 
+  async function reviewExits() {
+    setReviewing(true);
+    setReviewNote("");
+    setError("");
+    try {
+      const result = await api("/api/exits/review", { method: "POST" });
+      const count = (result.actions || []).length;
+      setReviewNote(
+        result.skipped
+          ? "Review skipped."
+          : `Reviewed ${count} plan${count === 1 ? "" : "s"}.`
+      );
+      await refresh();
+    } catch (e) {
+      setError(String(e.message || e));
+    } finally {
+      setReviewing(false);
+    }
+  }
+
   return (
     <div>
+      <div className="panel">
+        <div className="row" style={{ justifyContent: "space-between" }}>
+          <div>
+            <h3 style={{ margin: 0 }}>Position plans</h3>
+            <p className="muted" style={{ margin: "4px 0 0" }}>
+              Loss and trend breaks propose a flatten. An elapsed horizon re-runs research.
+            </p>
+          </div>
+          <button className="btn" disabled={reviewing} onClick={reviewExits}>
+            {reviewing ? "Reviewing…" : "Review exits"}
+          </button>
+        </div>
+        {reviewNote ? <p className="muted">{reviewNote}</p> : null}
+        <table className="table">
+          <thead>
+            <tr>
+              <th>Ticker</th>
+              <th>Qty</th>
+              <th>Avg</th>
+              <th>Review after</th>
+              <th>Nearest rule</th>
+              <th>Last close</th>
+            </tr>
+          </thead>
+          <tbody>
+            {(plans.plans || []).map((plan) => (
+              <tr key={plan.id}>
+                <td>{plan.ticker}</td>
+                <td>{plan.quantity}</td>
+                <td>{plan.avg_price != null ? Number(plan.avg_price).toFixed(2) : "—"}</td>
+                <td className="muted">
+                  {plan.review_after ? new Date(plan.review_after).toLocaleDateString() : "—"}
+                </td>
+                <td>{plan.nearest_rule || "unchecked"}</td>
+                <td>{plan.last_close != null ? Number(plan.last_close).toFixed(2) : "—"}</td>
+              </tr>
+            ))}
+            {!(plans.plans || []).length ? (
+              <tr>
+                <td colSpan={6} className="muted">
+                  No open plans. A plan is written when a buy fills.
+                </td>
+              </tr>
+            ) : null}
+          </tbody>
+        </table>
+        {(plans.unplanned || []).length ? (
+          <p className="muted">
+            Unplanned broker positions:{" "}
+            {plans.unplanned.map((p) => `${p.ticker} (${p.quantity})`).join(", ")}. These are not
+            auto-sold.
+          </p>
+        ) : null}
+      </div>
+
       <div className="panel">
         <div className="row" style={{ justifyContent: "space-between" }}>
           <div>
@@ -513,6 +720,7 @@ export default function App() {
       </div>
 
       {tab === "Runs" ? <RunsPanel /> : null}
+      {tab === "Scan" ? <ScanPanel onStarted={() => setTab("Runs")} /> : null}
       {tab === "Inbox" ? <InboxPanel /> : null}
       {tab === "Book" ? <BookPanel /> : null}
       {tab === "Audit" ? <AuditPanel /> : null}
