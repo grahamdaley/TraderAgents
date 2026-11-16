@@ -53,10 +53,14 @@ function Hint({ hint, children, className = "" }) {
 
   function show(event) {
     const rect = event.currentTarget.getBoundingClientRect();
-    setPos({
-      left: Math.round(rect.left),
-      top: Math.round(rect.bottom + 6),
-    });
+    const pad = 8;
+    const approxWidth = 280;
+    const left = Math.min(
+      Math.max(pad, Math.round(rect.left)),
+      Math.max(pad, window.innerWidth - approxWidth - pad)
+    );
+    const top = Math.round(rect.bottom + 6);
+    setPos({ left, top });
   }
 
   function hide() {
@@ -76,7 +80,16 @@ function Hint({ hint, children, className = "" }) {
       {children}
       {pos
         ? createPortal(
-            <span className="hint-bubble" style={{ left: pos.left, top: pos.top }} role="tooltip">
+            <span
+              className="hint-bubble"
+              role="tooltip"
+              style={{
+                position: "fixed",
+                left: `${pos.left}px`,
+                top: `${pos.top}px`,
+                zIndex: 1000,
+              }}
+            >
               {hint}
             </span>,
             document.body
