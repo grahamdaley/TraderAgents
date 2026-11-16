@@ -1,0 +1,4 @@
+config:
+  aws:profile: hkrdev
+  aws:region: ap-southeast-1
+  trader-agents:ecrUserName: trader-ecr

@@ -15,3 +15,7 @@ web/dist/
 *.log
 .idea/
 .vscode/
+
+# Pulumi
+infra/bin/
+infra/node_modules/

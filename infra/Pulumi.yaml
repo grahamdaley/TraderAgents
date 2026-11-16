@@ -1,0 +1,9 @@
+name: trader-agents
+description: ECR registries and IAM credentials for trader-agents Docker images
+runtime:
+  name: nodejs
+  options:
+    typescript: true
+config:
+  aws:region:
+    value: ap-southeast-1

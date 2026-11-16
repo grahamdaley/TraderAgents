@@ -1,0 +1,19 @@
+# Override for running pre-built ECR images (Linux box / future AWS VM).
+# Usage:
+#   docker compose -f docker-compose.yml -f docker-compose.deploy.yml pull
+#   docker compose -f docker-compose.yml -f docker-compose.deploy.yml up -d
+#
+# Set ECR_API_IMAGE and ECR_WEB_IMAGE in .env (full URI including tag).
+
+services:
+  api:
+    image: ${ECR_API_IMAGE}
+    build: !reset null
+    pull_policy: always
+    command: ["uvicorn", "trader.api:app", "--host", "0.0.0.0", "--port", "8000"]
+    volumes: !reset []
+
+  web:
+    image: ${ECR_WEB_IMAGE}
+    build: !reset null
+    pull_policy: always
