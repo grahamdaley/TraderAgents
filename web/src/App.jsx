@@ -1,6 +1,26 @@
 import React, { useCallback, useEffect, useState } from "react";
+import { createPortal } from "react-dom";
 
 const TABS = ["Runs", "Scan", "Inbox", "Book", "Audit"];
+
+const SECTOR_LABELS = {
+  XLK: "Information Technology",
+  XLY: "Consumer Discretionary",
+  XLP: "Consumer Staples",
+  XLV: "Health Care",
+  XLF: "Financials",
+  XLE: "Energy",
+  XLI: "Industrials",
+  XLB: "Materials",
+  XLRE: "Real Estate",
+  XLU: "Utilities",
+  XLC: "Communication Services",
+};
+
+function sectorLabel(code) {
+  if (!code) return "";
+  return SECTOR_LABELS[String(code).toUpperCase()] || "";
+}
 
 async function api(path, options = {}) {
   const res = await fetch(path, {
@@ -22,6 +42,48 @@ async function api(path, options = {}) {
 
 function Badge({ status }) {
   return <span className={`badge ${status || ""}`}>{status || "—"}</span>;
+}
+
+function Hint({ hint, children, className = "" }) {
+  const [pos, setPos] = useState(null);
+
+  if (!hint) {
+    return className ? <span className={className}>{children}</span> : children;
+  }
+
+  function show(event) {
+    const rect = event.currentTarget.getBoundingClientRect();
+    setPos({
+      left: Math.round(rect.left),
+      top: Math.round(rect.bottom + 6),
+    });
+  }
+
+  function hide() {
+    setPos(null);
+  }
+
+  return (
+    <span
+      className={`hint ${className}`.trim()}
+      data-hint={hint}
+      tabIndex={0}
+      onMouseEnter={show}
+      onMouseLeave={hide}
+      onFocus={show}
+      onBlur={hide}
+    >
+      {children}
+      {pos
+        ? createPortal(
+            <span className="hint-bubble" style={{ left: pos.left, top: pos.top }} role="tooltip">
+              {hint}
+            </span>,
+            document.body
+          )
+        : null}
+    </span>
+  );
 }
 
 function explain(error) {
@@ -119,7 +181,9 @@ function RunsPanel({ onSelectRun }) {
             <tbody>
               {runs.map((r) => (
                 <tr key={r.id}>
-                  <td>{r.ticker}</td>
+                  <td>
+                    <Hint hint={r.name}>{r.ticker}</Hint>
+                  </td>
                   <td>
                     <Badge status={r.status} />
                   </td>
@@ -152,7 +216,10 @@ function RunsPanel({ onSelectRun }) {
         ) : (
           <>
             <p>
-              <strong>{selected.ticker}</strong> · <Badge status={selected.status} />
+              <Hint hint={selected.name}>
+                <strong>{selected.ticker}</strong>
+              </Hint>{" "}
+              · <Badge status={selected.status} />
             </p>
             {selected.error ? <div className="error">{selected.error}</div> : null}
             <div className="nodes" style={{ marginBottom: 12 }}>
@@ -250,8 +317,12 @@ function ScanPanel({ onStarted }) {
           {candidates.map((row) => (
             <tr key={`${row.ticker}-${row.rank}`}>
               <td>{row.rank}</td>
-              <td>{row.ticker}</td>
-              <td className="muted">{row.sector}</td>
+              <td>
+                <Hint hint={row.name}>{row.ticker}</Hint>
+              </td>
+              <td className="muted">
+                <Hint hint={sectorLabel(row.sector)}>{row.sector}</Hint>
+              </td>
               <td>{row.score}</td>
               <td className="muted">{(row.signals || []).join(", ")}</td>
               <td>{row.reason}</td>

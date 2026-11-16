@@ -113,13 +113,22 @@ async def create_run(
         raise HTTPException(500, str(exc)) from exc
 
 
+def _universe_names() -> dict[str, str]:
+    try:
+        return {row["ticker"].upper(): row.get("name") or "" for row in load_universe()}
+    except Exception:  # noqa: BLE001
+        return {}
+
+
 @app.get("/api/runs")
 async def runs(session: AsyncSession = Depends(get_session)) -> list[dict[str, Any]]:
     rows = await store.list_runs(session)
+    names = _universe_names()
     return [
         {
             "id": r.id,
             "ticker": r.ticker,
+            "name": names.get(r.ticker.upper(), ""),
             "status": r.status,
             "nodes": r.nodes,
             "error": r.error,
@@ -137,9 +146,11 @@ async def run_detail(
     row = await store.get_run(session, run_id)
     if not row:
         raise HTTPException(404, "run not found")
+    names = _universe_names()
     return {
         "id": row.id,
         "ticker": row.ticker,
+        "name": names.get(row.ticker.upper(), ""),
         "status": row.status,
         "nodes": row.nodes,
         "state": row.state_snapshot,
