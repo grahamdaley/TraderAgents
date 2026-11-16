@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from datetime import timedelta
 
 from trader.config import Settings, get_settings
@@ -124,16 +125,21 @@ def build_trade_proposal(
         raise PolicyRejection("Invalid reference price", checks)
 
     target_notional = nav * size_pct
-    quantity = round(target_notional / reference_price, 4)
+    # IBKR API rejects fractional US stock orders (error 10243).
+    quantity = float(math.floor(target_notional / reference_price))
     current_qty = _position_qty(book, ticker)
 
     if thesis.side == Side.BUY:
-        if target_notional > book.cash:
+        notional = quantity * reference_price
+        if quantity <= 0 or notional > book.cash:
             checks.append(
                 PolicyCheck(
                     name="cash_check",
                     passed=False,
-                    detail=f"Need ~{target_notional:.2f}, cash={book.cash:.2f}",
+                    detail=(
+                        f"Need ~{target_notional:.2f} ({quantity} whole shares), "
+                        f"cash={book.cash:.2f}"
+                    ),
                 )
             )
             raise PolicyRejection("Insufficient cash", checks)
@@ -141,7 +147,7 @@ def build_trade_proposal(
             PolicyCheck(
                 name="cash_check",
                 passed=True,
-                detail=f"Cash {book.cash:.2f} covers notional {target_notional:.2f}",
+                detail=f"Cash {book.cash:.2f} covers {quantity} shares (~{notional:.2f})",
             )
         )
     elif thesis.side == Side.SELL:
@@ -154,9 +160,9 @@ def build_trade_proposal(
                 )
             )
             raise PolicyRejection("SELL requires an existing long position", checks)
-        quantity = current_qty
+        quantity = float(math.floor(current_qty))
         if nav > 0:
-            size_pct = min(1.0, (current_qty * reference_price) / nav)
+            size_pct = min(1.0, (quantity * reference_price) / nav)
         checks.append(
             PolicyCheck(
                 name="sell_requires_long",
@@ -170,12 +176,14 @@ def build_trade_proposal(
             PolicyCheck(
                 name="quantity_positive",
                 passed=False,
-                detail="Computed quantity is zero",
+                detail="Computed whole-share quantity is zero",
             )
         )
         raise PolicyRejection("Quantity is zero", checks)
 
-    limit_price = round(reference_price * (1.001 if thesis.side == Side.BUY else 0.999), 4)
+    limit_price = round(
+        reference_price * (1.001 if thesis.side == Side.BUY else 0.999), 2
+    )
     expires_at = utcnow() + timedelta(minutes=settings.proposal_ttl_minutes)
     proposal = TradeProposal(
         run_id=run_id,

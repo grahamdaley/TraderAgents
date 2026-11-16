@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import threading
 from collections.abc import Coroutine
 from typing import Any, TypeVar
@@ -388,18 +389,26 @@ class IBKRAdapter:
         contract = Stock(proposal.ticker.upper(), "SMART", "USD")
         await ib.qualifyContractsAsync(contract)
         action = "BUY" if proposal.side == Side.BUY else "SELL"
+        # IBKR API rejects fractional US equity sizes (error 10243).
+        share_qty = int(math.floor(float(proposal.quantity)))
+        if share_qty < 1:
+            raise BrokerError(
+                f"Quantity {proposal.quantity} rounds to zero whole shares; "
+                "IBKR API cannot place fractional stock orders"
+            )
         is_limit = proposal.order_type.value == "LIMIT" and proposal.limit_price
         if is_limit:
-            order = LimitOrder(action, proposal.quantity, proposal.limit_price)
-            # DAY rests for the next regular session; GTC if approving well before open.
-            order.tif = "DAY" if session_open else "DAY"
+            limit = round(float(proposal.limit_price), 2)
+            order = LimitOrder(action, share_qty, limit)
+            # DAY rests for the next regular session when placed off-hours.
+            order.tif = "DAY"
         else:
             if not session_open:
                 raise BrokerError(
                     "Market orders cannot be held outside US regular hours; "
                     "use a limit order or approve after the open"
                 )
-            order = MarketOrder(action, proposal.quantity)
+            order = MarketOrder(action, share_qty)
         order.orderRef = intent.client_order_id
         if self.settings.ibkr_account_id:
             order.account = self.settings.ibkr_account_id
@@ -419,6 +428,14 @@ class IBKRAdapter:
 
         status = trade.orderStatus.status
         order_id = str(trade.order.orderId)
+        if status in {"Cancelled", "ApiCancelled", "Inactive"}:
+            detail = ""
+            if trade.log:
+                detail = trade.log[-1].message or ""
+            raise BrokerError(
+                f"IBKR order not accepted: status={status}"
+                + (f" ({detail})" if detail else "")
+            )
         if status == "Filled" or trade.orderStatus.filled > 0:
             fill_price = float(trade.orderStatus.avgFillPrice or live_price)
             filled_qty = float(trade.orderStatus.filled or proposal.quantity)

@@ -580,9 +580,10 @@ def execute_node(state: ICState) -> dict[str, Any]:
     proposal = TradeProposal.model_validate(state["trade_proposal"])
     if action == "approve_with_edits":
         if decision.get("quantity") is not None:
-            proposal.quantity = float(decision["quantity"])
+            # Whole shares only — IBKR API rejects fractional US stock sizes.
+            proposal.quantity = float(int(float(decision["quantity"])))
         if decision.get("limit_price") is not None:
-            proposal.limit_price = float(decision["limit_price"])
+            proposal.limit_price = round(float(decision["limit_price"]), 2)
         # SELL stays at or under the live long; oversized edits are clamped.
         if proposal.side == Side.SELL:
             book = get_broker().get_book()
