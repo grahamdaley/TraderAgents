@@ -59,6 +59,7 @@ class ICState(TypedDict, total=False):
     human_decision: dict[str, Any] | None
     fill: dict[str, Any] | None
     execution_intent: dict[str, Any] | None
+    submit_result: dict[str, Any] | None
     model_ids: Annotated[dict[str, str], _merge_dicts]
     citation_ids: Annotated[list[str], operator.add]
     error: str | None

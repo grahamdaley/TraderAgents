@@ -545,6 +545,8 @@ function BookPanel() {
   const [error, setError] = useState("");
   const [reviewNote, setReviewNote] = useState("");
   const [reviewing, setReviewing] = useState(false);
+  const [reconciling, setReconciling] = useState(false);
+  const [reconcileNote, setReconcileNote] = useState("");
 
   const refresh = useCallback(async () => {
     const [b, f, p] = await Promise.all([
@@ -580,6 +582,29 @@ function BookPanel() {
       setError(String(e.message || e));
     } finally {
       setReviewing(false);
+    }
+  }
+
+  async function reconcileFills() {
+    setReconciling(true);
+    setReconcileNote("");
+    setError("");
+    try {
+      const result = await api("/api/fills/reconcile", { method: "POST" });
+      const actions = result.actions || [];
+      const filled = actions.filter((a) => a.action === "filled").length;
+      const working = actions.filter((a) => a.action === "working" || a.action === "pending").length;
+      const cancelled = actions.filter((a) => a.action === "cancelled").length;
+      setReconcileNote(
+        result.error
+          ? `Reconcile error: ${result.error}`
+          : `Checked ${result.checked || 0}: ${filled} filled, ${working} still working, ${cancelled} cancelled.`
+      );
+      await refresh();
+    } catch (e) {
+      setError(String(e.message || e));
+    } finally {
+      setReconciling(false);
     }
   }
 
@@ -687,10 +712,68 @@ function BookPanel() {
             ) : null}
           </tbody>
         </table>
+
+        <h4 style={{ margin: "20px 0 8px" }}>Open orders</h4>
+        <p className="muted" style={{ margin: "0 0 8px" }}>
+          Live working orders at IBKR (limits rest until filled or DAY expires at the US close).
+        </p>
+        <table className="table">
+          <thead>
+            <tr>
+              <th>Id</th>
+              <th>Ticker</th>
+              <th>Side</th>
+              <th>Qty</th>
+              <th>Type</th>
+              <th>Limit</th>
+              <th>TIF</th>
+              <th>Status</th>
+              <th>Filled</th>
+            </tr>
+          </thead>
+          <tbody>
+            {(book?.open_orders || []).map((o) => (
+              <tr key={o.order_id}>
+                <td className="muted">{o.order_id}</td>
+                <td>{o.ticker}</td>
+                <td>{o.side}</td>
+                <td>{o.quantity}</td>
+                <td>{o.order_type || "—"}</td>
+                <td>{o.limit_price != null ? Number(o.limit_price).toFixed(2) : "—"}</td>
+                <td>{o.tif || "—"}</td>
+                <td>
+                  <Badge status={o.status} />
+                </td>
+                <td>
+                  {o.filled != null ? o.filled : "—"}
+                  {o.remaining != null ? ` / ${o.remaining} left` : ""}
+                </td>
+              </tr>
+            ))}
+            {!(book?.open_orders || []).length ? (
+              <tr>
+                <td colSpan={9} className="muted">
+                  No open orders.
+                </td>
+              </tr>
+            ) : null}
+          </tbody>
+        </table>
       </div>
 
       <div className="panel">
-        <h3 style={{ marginTop: 0 }}>Fills</h3>
+        <div className="row" style={{ justifyContent: "space-between" }}>
+          <div>
+            <h3 style={{ margin: 0 }}>Fills</h3>
+            <p className="muted" style={{ margin: "4px 0 0" }}>
+              Desk fill records. Resting orders are picked up by reconcile (also runs in the background).
+            </p>
+          </div>
+          <button className="btn secondary" disabled={reconciling} onClick={reconcileFills}>
+            {reconciling ? "Reconciling…" : "Reconcile fills"}
+          </button>
+        </div>
+        {reconcileNote ? <p className="muted">{reconcileNote}</p> : null}
         <table className="table">
           <thead>
             <tr>
@@ -718,7 +801,7 @@ function BookPanel() {
             {!fills.length ? (
               <tr>
                 <td colSpan={6} className="muted">
-                  No fills yet.
+                  No fills recorded yet. Use Reconcile fills if IBKR already filled resting orders.
                 </td>
               </tr>
             ) : null}

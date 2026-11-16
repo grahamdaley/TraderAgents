@@ -181,9 +181,52 @@ async def mark_intent_submitted(
 ) -> None:
     row = await session.get(IntentRow, intent_id)
     if row:
-        row.broker_order_id = broker_order_id
+        if broker_order_id:
+            row.broker_order_id = broker_order_id
         row.status = "submitted"
         await session.commit()
+
+
+async def mark_intent_status(
+    session: AsyncSession,
+    intent_id: str,
+    status: str,
+    *,
+    broker_order_id: str | None = None,
+) -> None:
+    row = await session.get(IntentRow, intent_id)
+    if not row:
+        return
+    row.status = status
+    if broker_order_id:
+        row.broker_order_id = broker_order_id
+    await session.commit()
+
+
+async def get_fill_for_intent(session: AsyncSession, intent_id: str) -> FillRow | None:
+    result = await session.execute(
+        select(FillRow).where(FillRow.intent_id == intent_id).limit(1)
+    )
+    return result.scalar_one_or_none()
+
+
+async def list_submitted_intents_without_fills(
+    session: AsyncSession, *, limit: int = 200
+) -> list[IntentRow]:
+    """Resting intents that still need fill reconciliation.
+
+    Includes legacy ``created`` rows from before submit_result was persisted
+    on graph state (those never flipped to ``submitted``).
+    """
+    result = await session.execute(
+        select(IntentRow)
+        .outerjoin(FillRow, FillRow.intent_id == IntentRow.id)
+        .where(IntentRow.status.in_(("submitted", "created")))
+        .where(FillRow.id.is_(None))
+        .order_by(IntentRow.created_at.asc())
+        .limit(limit)
+    )
+    return list(result.scalars())
 
 
 async def save_fill(session: AsyncSession, fill: FillRecord) -> FillRow:

@@ -273,16 +273,32 @@ class IBKRAdapter:
                 )
             )
 
-        open_orders = [
-            {
-                "order_id": trade.order.orderId,
-                "ticker": trade.contract.symbol,
-                "side": trade.order.action,
-                "quantity": trade.order.totalQuantity,
-                "status": trade.orderStatus.status,
-            }
-            for trade in ib.openTrades()
-        ]
+        try:
+            await ib.reqAllOpenOrdersAsync()
+        except Exception:  # noqa: BLE001
+            logger.exception("reqAllOpenOrders failed while building book")
+
+        open_orders = []
+        for trade in ib.openTrades():
+            order_type = str(trade.order.orderType or "")
+            limit_price = None
+            if order_type == "LMT" and trade.order.lmtPrice is not None:
+                limit_price = float(trade.order.lmtPrice)
+            open_orders.append(
+                {
+                    "order_id": trade.order.orderId,
+                    "ticker": trade.contract.symbol,
+                    "side": trade.order.action,
+                    "quantity": float(trade.order.totalQuantity),
+                    "order_type": order_type,
+                    "limit_price": limit_price,
+                    "tif": str(trade.order.tif or ""),
+                    "status": trade.orderStatus.status,
+                    "filled": float(trade.orderStatus.filled or 0),
+                    "remaining": float(trade.orderStatus.remaining or 0),
+                    "order_ref": str(getattr(trade.order, "orderRef", "") or ""),
+                }
+            )
 
         return BookSnapshot(
             account_id=account or "unknown",
@@ -427,7 +443,9 @@ class IBKRAdapter:
                 break
 
         status = trade.orderStatus.status
-        order_id = str(trade.order.orderId)
+        order_id = str(trade.order.orderId or getattr(trade.orderStatus, "orderId", "") or "")
+        if order_id in {"0", "None"}:
+            order_id = ""
         if status in {"Cancelled", "ApiCancelled", "Inactive"}:
             detail = ""
             if trade.log:
@@ -470,6 +488,149 @@ class IBKRAdapter:
             )
 
         raise BrokerError(f"IBKR order not accepted: status={status}")
+
+    def lookup_order_outcomes(
+        self, queries: list[dict[str, str]]
+    ) -> dict[str, dict[str, Any]]:
+        """Resolve resting intents against IBKR open/completed orders.
+
+        ``queries`` items use ``client_order_id`` (orderRef) and optional
+        ``broker_order_id``. Returns a map keyed by client_order_id.
+        """
+        if not queries:
+            return {}
+        self.assert_trading_mode_safe()
+        if self._ib is None:
+            return {}
+        return self._run_coro(self._lookup_order_outcomes_async(queries))
+
+    async def _lookup_order_outcomes_async(
+        self, queries: list[dict[str, str]]
+    ) -> dict[str, dict[str, Any]]:
+        ib = self._ib
+        assert ib is not None
+        try:
+            await ib.reqAllOpenOrdersAsync()
+        except Exception:  # noqa: BLE001
+            logger.exception("reqAllOpenOrders failed during fill reconcile")
+        try:
+            # API-placed orders only — matches our orderRef client ids.
+            await ib.reqCompletedOrdersAsync(True)
+        except Exception:  # noqa: BLE001
+            logger.exception("reqCompletedOrders failed during fill reconcile")
+
+        # Completed-order status often has filled/avg wiped; executions keep the truth.
+        exec_by_ref: dict[str, dict[str, Any]] = {}
+        try:
+            from ib_async import ExecutionFilter
+
+            fill_rows = await ib.reqExecutionsAsync(ExecutionFilter())
+            for fill in fill_rows:
+                execution = fill.execution
+                ref = str(getattr(execution, "orderRef", None) or "").strip()
+                if not ref:
+                    continue
+                shares = float(execution.shares or 0)
+                price = float(
+                    getattr(execution, "avgPrice", None) or execution.price or 0
+                )
+                if shares <= 0 or price <= 0:
+                    continue
+                prev = exec_by_ref.get(ref)
+                if prev:
+                    total_shares = prev["filled_qty"] + shares
+                    prev["avg_price"] = (
+                        prev["avg_price"] * prev["filled_qty"] + price * shares
+                    ) / total_shares
+                    prev["filled_qty"] = total_shares
+                    if execution.orderId:
+                        prev["broker_order_id"] = str(execution.orderId)
+                else:
+                    side = str(execution.side or "").upper()
+                    if side in {"BOT", "BUY"}:
+                        side = "BUY"
+                    elif side in {"SLD", "SELL"}:
+                        side = "SELL"
+                    exec_by_ref[ref] = {
+                        "broker_order_id": str(execution.orderId or ""),
+                        "client_order_id": ref,
+                        "status": "Filled",
+                        "filled_qty": shares,
+                        "avg_price": price,
+                        "remaining": 0.0,
+                        "ticker": getattr(fill.contract, "symbol", "") or "",
+                        "side": side,
+                    }
+        except Exception:  # noqa: BLE001
+            logger.exception("reqExecutions failed during fill reconcile")
+
+        by_ref: dict[str, dict[str, Any]] = dict(exec_by_ref)
+        by_id: dict[str, dict[str, Any]] = {
+            str(v["broker_order_id"]): v
+            for v in exec_by_ref.values()
+            if v.get("broker_order_id") and v["broker_order_id"] not in {"", "0"}
+        }
+        for trade in ib.trades():
+            order = trade.order
+            status = trade.orderStatus
+            ref = str(getattr(order, "orderRef", None) or "").strip()
+            oid = str(order.orderId or "")
+            if oid in {"0", "None"}:
+                oid = ""
+            filled_qty = float(status.filled or 0)
+            avg_price = float(status.avgFillPrice or 0)
+            if ref and ref in exec_by_ref:
+                # Prefer execution totals when completed-order status is empty.
+                filled_qty = max(filled_qty, float(exec_by_ref[ref]["filled_qty"]))
+                avg_price = avg_price or float(exec_by_ref[ref]["avg_price"])
+                if not oid:
+                    oid = str(exec_by_ref[ref].get("broker_order_id") or "")
+            elif filled_qty > 0 and avg_price <= 0 and trade.fills:
+                notionals = [
+                    float(f.execution.shares) * float(f.execution.price)
+                    for f in trade.fills
+                    if float(f.execution.shares or 0) > 0
+                ]
+                shares = sum(float(f.execution.shares or 0) for f in trade.fills)
+                if shares > 0 and notionals:
+                    avg_price = sum(notionals) / shares
+            entry = {
+                "broker_order_id": oid,
+                "client_order_id": ref,
+                "status": str(status.status or ""),
+                "filled_qty": filled_qty,
+                "avg_price": avg_price,
+                "remaining": float(status.remaining or 0),
+                "ticker": getattr(trade.contract, "symbol", "") or "",
+                "side": str(order.action or ""),
+            }
+            if ref:
+                # Don't let an empty completed-order status clobber execution data.
+                existing = by_ref.get(ref)
+                if existing and float(existing.get("filled_qty") or 0) > 0:
+                    if float(entry["filled_qty"] or 0) <= 0:
+                        entry["filled_qty"] = existing["filled_qty"]
+                        entry["avg_price"] = existing["avg_price"]
+                        entry["status"] = entry["status"] or existing["status"]
+                        entry["remaining"] = 0.0
+                    if not entry["broker_order_id"]:
+                        entry["broker_order_id"] = existing.get("broker_order_id") or ""
+                by_ref[ref] = entry
+            if oid:
+                by_id[oid] = entry
+
+        out: dict[str, dict[str, Any]] = {}
+        for query in queries:
+            client_id = str(query.get("client_order_id") or "").strip()
+            broker_id = str(query.get("broker_order_id") or "").strip()
+            hit = (by_ref.get(client_id) if client_id else None) or (
+                by_id.get(broker_id) if broker_id else None
+            )
+            if hit and client_id:
+                out[client_id] = hit
+            elif hit and broker_id:
+                out[broker_id] = hit
+        return out
 
     def _mock_fill(
         self, proposal: TradeProposal, intent: ExecutionIntent, live_price: float

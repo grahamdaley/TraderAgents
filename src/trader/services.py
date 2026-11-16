@@ -239,10 +239,14 @@ async def resume_with_decision(
     elif intent_data and status == RunStatus.SUBMITTED.value:
         intent = ExecutionIntent.model_validate(intent_data)
         intent.approval_id = approval_id
+        # Prefer submit_result; fall back to empty — reconcile matches on client_order_id.
         broker_order_id = str(submit_result.get("broker_order_id") or "")
+        if broker_order_id in {"", "0"}:
+            broker_order_id = ""
         await store.save_intent(session, intent)
-        if broker_order_id:
-            await store.mark_intent_submitted(session, intent.intent_id, broker_order_id)
+        await store.mark_intent_submitted(
+            session, intent.intent_id, broker_order_id or ""
+        )
         await store.add_audit(
             session,
             event_type="order_submitted",
@@ -250,6 +254,7 @@ async def resume_with_decision(
             run_id=run_id,
             payload={
                 "broker_order_id": broker_order_id,
+                "client_order_id": intent.client_order_id,
                 "broker_status": submit_result.get("broker_status"),
                 "ticker": intent.ticker,
                 "quantity": intent.quantity,

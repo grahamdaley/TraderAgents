@@ -16,6 +16,7 @@ from trader.broker import get_broker
 from trader.config import get_settings
 from trader.db import get_session_factory, init_db
 from trader.exits import exit_review_loop, review_exits
+from trader.fills import fill_reconcile_loop, reconcile_submitted_fills
 from trader.nous import NousCatalogError, verify_configured_models
 from trader.positions import plan_to_dict
 from trader.scanner import load_universe, run_scan
@@ -60,12 +61,14 @@ async def lifespan(app: FastAPI):
     except Exception as exc:  # noqa: BLE001
         logger.warning("Graph init warning: %s", exc)
     review_task = asyncio.create_task(exit_review_loop())
+    fill_task = asyncio.create_task(fill_reconcile_loop())
     yield
-    review_task.cancel()
-    try:
-        await review_task
-    except asyncio.CancelledError:
-        pass
+    for task in (review_task, fill_task):
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
 
 
 app = FastAPI(title="Research Desk", version="0.1.0", lifespan=lifespan)
@@ -223,6 +226,16 @@ async def book() -> dict[str, Any]:
         return snap.model_dump(mode="json")
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(503, f"book unavailable: {exc}") from exc
+
+
+@app.post("/api/fills/reconcile")
+async def fills_reconcile(session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
+    """Pull late IBKR fills for resting intents and open position plans."""
+    try:
+        return await reconcile_submitted_fills(session)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("fill reconcile failed")
+        raise HTTPException(500, str(exc)) from exc
 
 
 @app.get("/api/fills")
