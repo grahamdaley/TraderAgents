@@ -7,6 +7,7 @@ from collections.abc import Coroutine
 from typing import Any, TypeVar
 
 from trader.config import Settings, get_settings
+from trader.market_hours import us_equity_session_open
 from trader.policy import revalidate_for_execution
 from trader.schemas import (
     BookSnapshot,
@@ -14,6 +15,7 @@ from trader.schemas import (
     FillRecord,
     PositionView,
     Side,
+    SubmitResult,
     TradeProposal,
     utcnow,
 )
@@ -291,18 +293,31 @@ class IBKRAdapter:
             source="ibkr",
         )
 
-    def get_quote(self, ticker: str) -> float:
+    def get_quote(self, ticker: str, *, allow_stale: bool = False) -> float:
         self.assert_trading_mode_safe()
         if self._ib is None:
-            from trader.tools.market_data import get_market_data_tools
+            return self._yahoo_last_close(ticker)
 
-            indicators = get_market_data_tools().compute_indicators(ticker)
-            last = (indicators.get("indicators") or {}).get("last_close")
-            if not last:
-                raise BrokerError(f"No mock quote for {ticker}")
-            return float(last)
+        try:
+            return self._run_coro(self._get_quote_async(ticker))
+        except BrokerError:
+            if not allow_stale and us_equity_session_open():
+                raise
+            logger.warning(
+                "IBKR quote unavailable for %s; falling back to Yahoo last close",
+                ticker,
+            )
+            return self._yahoo_last_close(ticker)
 
-        return self._run_coro(self._get_quote_async(ticker))
+    @staticmethod
+    def _yahoo_last_close(ticker: str) -> float:
+        from trader.tools.market_data import get_market_data_tools
+
+        indicators = get_market_data_tools().compute_indicators(ticker)
+        last = (indicators.get("indicators") or {}).get("last_close")
+        if not last:
+            raise BrokerError(f"No fallback quote for {ticker}")
+        return float(last)
 
     async def _get_quote_async(self, ticker: str) -> float:
         from ib_async import Stock
@@ -326,24 +341,35 @@ class IBKRAdapter:
         proposal: TradeProposal,
         intent: ExecutionIntent,
         content_hash: str,
-    ) -> FillRecord:
+    ) -> SubmitResult:
         with self._lock:
             self.assert_trading_mode_safe()
             book = self.get_book()
-            live_price = self.get_quote(proposal.ticker)
+            session_open = us_equity_session_open()
+            # Off-hours: IB often has no live print; use Yahoo last close / allow stale.
+            live_price = self.get_quote(proposal.ticker, allow_stale=not session_open)
             revalidate_for_execution(
                 proposal=proposal,
                 content_hash=content_hash,
                 book=book,
                 live_price=live_price,
                 settings=self.settings,
+                skip_price_band=not session_open,
             )
 
             if self._ib is None:
-                return self._mock_fill(proposal, intent, live_price)
+                fill = self._mock_fill(proposal, intent, live_price)
+                return SubmitResult(
+                    status="filled",
+                    broker_order_id=fill.broker_order_id,
+                    broker_status="Filled",
+                    fill=fill,
+                )
 
             return self._run_coro(
-                self._submit_async(proposal, intent, live_price, book)
+                self._submit_async(
+                    proposal, intent, live_price, book, session_open=session_open
+                )
             )
 
     async def _submit_async(
@@ -352,7 +378,9 @@ class IBKRAdapter:
         intent: ExecutionIntent,
         live_price: float,
         book: BookSnapshot,
-    ) -> FillRecord:
+        *,
+        session_open: bool,
+    ) -> SubmitResult:
         from ib_async import LimitOrder, MarketOrder, Stock
 
         ib = self._ib
@@ -360,9 +388,17 @@ class IBKRAdapter:
         contract = Stock(proposal.ticker.upper(), "SMART", "USD")
         await ib.qualifyContractsAsync(contract)
         action = "BUY" if proposal.side == Side.BUY else "SELL"
-        if proposal.order_type.value == "LIMIT" and proposal.limit_price:
+        is_limit = proposal.order_type.value == "LIMIT" and proposal.limit_price
+        if is_limit:
             order = LimitOrder(action, proposal.quantity, proposal.limit_price)
+            # DAY rests for the next regular session; GTC if approving well before open.
+            order.tif = "DAY" if session_open else "DAY"
         else:
+            if not session_open:
+                raise BrokerError(
+                    "Market orders cannot be held outside US regular hours; "
+                    "use a limit order or approve after the open"
+                )
             order = MarketOrder(action, proposal.quantity)
         order.orderRef = intent.client_order_id
         if self.settings.ibkr_account_id:
@@ -376,24 +412,47 @@ class IBKRAdapter:
                 "Cancelled",
                 "Inactive",
                 "ApiCancelled",
+                "Submitted",
+                "PreSubmitted",
             }:
                 break
 
         status = trade.orderStatus.status
-        if status != "Filled" and trade.orderStatus.filled <= 0:
-            raise BrokerError(f"IBKR order not filled: status={status}")
+        order_id = str(trade.order.orderId)
+        if status == "Filled" or trade.orderStatus.filled > 0:
+            fill_price = float(trade.orderStatus.avgFillPrice or live_price)
+            filled_qty = float(trade.orderStatus.filled or proposal.quantity)
+            fill = FillRecord(
+                intent_id=intent.intent_id,
+                broker_order_id=order_id,
+                ticker=proposal.ticker.upper(),
+                side=proposal.side,
+                quantity=filled_qty,
+                fill_price=fill_price,
+                account_id=self.settings.ibkr_account_id or book.account_id,
+            )
+            return SubmitResult(
+                status="filled",
+                broker_order_id=order_id,
+                broker_status=status,
+                fill=fill,
+            )
 
-        fill_price = float(trade.orderStatus.avgFillPrice or live_price)
-        filled_qty = float(trade.orderStatus.filled or proposal.quantity)
-        return FillRecord(
-            intent_id=intent.intent_id,
-            broker_order_id=str(trade.order.orderId),
-            ticker=proposal.ticker.upper(),
-            side=proposal.side,
-            quantity=filled_qty,
-            fill_price=fill_price,
-            account_id=self.settings.ibkr_account_id or book.account_id,
-        )
+        resting = {"Submitted", "PreSubmitted", "PendingSubmit", "PendingCancel"}
+        if is_limit and status in resting:
+            when = "next US regular session" if not session_open else "the market"
+            return SubmitResult(
+                status="submitted",
+                broker_order_id=order_id,
+                broker_status=status,
+                fill=None,
+                message=(
+                    f"Limit order resting at IBKR (status={status}); "
+                    f"will work when {when} is open"
+                ),
+            )
+
+        raise BrokerError(f"IBKR order not accepted: status={status}")
 
     def _mock_fill(
         self, proposal: TradeProposal, intent: ExecutionIntent, live_price: float

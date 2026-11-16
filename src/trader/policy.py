@@ -201,6 +201,7 @@ def revalidate_for_execution(
     book: BookSnapshot,
     live_price: float,
     settings: Settings | None = None,
+    skip_price_band: bool = False,
 ) -> list[PolicyCheck]:
     settings = settings or get_settings()
     checks: list[PolicyCheck] = []
@@ -227,29 +228,38 @@ def revalidate_for_execution(
         )
     checks.append(PolicyCheck(name="ttl", passed=True, detail="Within TTL"))
 
-    band = settings.price_band_pct
-    move = abs(live_price - proposal.reference_price) / proposal.reference_price
-    if move > band:
-        raise PolicyRejection(
-            "Price moved outside band",
-            [
-                PolicyCheck(
-                    name="price_band",
-                    passed=False,
-                    detail=(
-                        f"Live {live_price:.4f} vs ref {proposal.reference_price:.4f} "
-                        f"({move:.2%} > {band:.2%})"
-                    ),
-                )
-            ],
+    if skip_price_band:
+        checks.append(
+            PolicyCheck(
+                name="price_band",
+                passed=True,
+                detail="Skipped outside US regular hours; limit order will rest at IBKR",
+            )
         )
-    checks.append(
-        PolicyCheck(
-            name="price_band",
-            passed=True,
-            detail=f"Price move {move:.2%} within {band:.2%}",
+    else:
+        band = settings.price_band_pct
+        move = abs(live_price - proposal.reference_price) / proposal.reference_price
+        if move > band:
+            raise PolicyRejection(
+                "Price moved outside band",
+                [
+                    PolicyCheck(
+                        name="price_band",
+                        passed=False,
+                        detail=(
+                            f"Live {live_price:.4f} vs ref {proposal.reference_price:.4f} "
+                            f"({move:.2%} > {band:.2%})"
+                        ),
+                    )
+                ],
+            )
+        checks.append(
+            PolicyCheck(
+                name="price_band",
+                passed=True,
+                detail=f"Price move {move:.2%} within {band:.2%}",
+            )
         )
-    )
 
     if proposal.ticker.upper() in settings.restricted_set:
         raise PolicyRejection(

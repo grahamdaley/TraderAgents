@@ -620,19 +620,29 @@ def execute_node(state: ICState) -> dict[str, Any]:
         limit_price=proposal.limit_price,
     )
     try:
-        fill = get_broker().submit(
+        result = get_broker().submit(
             proposal=proposal,
             intent=intent,
             content_hash=proposal.content_hash,
         )
         nodes = _mark(nodes, "execute", NodeStatus.DONE)
-        return {
+        out: dict[str, Any] = {
             "nodes": nodes,
             "trade_proposal": proposal.model_dump(mode="json"),
             "execution_intent": intent.model_dump(mode="json"),
-            "fill": fill.model_dump(mode="json"),
-            "status": RunStatus.FILLED.value,
+            "submit_result": result.model_dump(mode="json"),
         }
+        if result.status == "filled" and result.fill is not None:
+            out["fill"] = result.fill.model_dump(mode="json")
+            out["status"] = RunStatus.FILLED.value
+        else:
+            out["status"] = RunStatus.SUBMITTED.value
+            out["error"] = None
+            # Surface resting-order note on the execute node for the Runs panel.
+            if result.message:
+                nodes = _mark(nodes, "execute", NodeStatus.DONE, error=result.message)
+                out["nodes"] = nodes
+        return out
     except Exception as exc:  # noqa: BLE001
         nodes = _mark(nodes, "execute", NodeStatus.FAILED, error=str(exc))
         return {

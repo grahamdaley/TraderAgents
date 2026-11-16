@@ -151,9 +151,9 @@ def test_approve_with_edits_clamps_sell_to_live_long(monkeypatch):
         def submit(self, *, proposal, intent, content_hash):
             assert proposal.quantity == 5
             assert intent.quantity == 5
-            from trader.schemas import FillRecord
+            from trader.schemas import FillRecord, SubmitResult
 
-            return FillRecord(
+            fill = FillRecord(
                 intent_id=intent.intent_id,
                 broker_order_id="MOCK-1",
                 ticker="AAPL",
@@ -161,6 +161,12 @@ def test_approve_with_edits_clamps_sell_to_live_long(monkeypatch):
                 quantity=5,
                 fill_price=100.0,
                 account_id="DU123",
+            )
+            return SubmitResult(
+                status="filled",
+                broker_order_id=fill.broker_order_id,
+                broker_status="Filled",
+                fill=fill,
             )
 
     monkeypatch.setattr("trader.graph.get_broker", lambda: FakeBroker())

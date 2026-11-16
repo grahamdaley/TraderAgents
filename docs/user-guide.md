@@ -135,7 +135,9 @@ For each proposal you can:
 | **Reject** | End the run; no order |
 | **Request research** | End without submitting (same as reject for execution) |
 
-Approvals are **idempotent**: a second decision on the same run returns HTTP 409. A proposal expires after `PROPOSAL_TTL_MINUTES` (default 30). If the live quote has moved more than `PRICE_BAND_PCT` (default 2%) from the proposal reference price, submission is blocked.
+Approvals are **idempotent**: a second decision on the same run returns HTTP 409. A proposal expires after `PROPOSAL_TTL_MINUTES` (default 30). If the live quote has moved more than `PRICE_BAND_PCT` (default 2%) from the proposal reference price **during US regular hours**, submission is blocked.
+
+Research can run any time (Yahoo data). You can **approve outside US market hours**: limit orders are sent to IBKR as resting DAY orders (status `submitted`) and work at the next regular session. Market orders are refused off-hours. Inbox shows a notice when an order is resting vs filled vs failed.
 
 ### Book
 

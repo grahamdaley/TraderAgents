@@ -216,7 +216,8 @@ async def resume_with_decision(
 
     fill = values.get("fill")
     intent_data = values.get("execution_intent")
-    if fill and intent_data:
+    submit_result = values.get("submit_result") or {}
+    if intent_data and fill:
         intent = ExecutionIntent.model_validate(intent_data)
         intent.approval_id = approval_id
         fill_rec = FillRecord.model_validate(fill)
@@ -235,6 +236,27 @@ async def resume_with_decision(
             },
         )
         await record_fill_on_plan(session, values)
+    elif intent_data and status == RunStatus.SUBMITTED.value:
+        intent = ExecutionIntent.model_validate(intent_data)
+        intent.approval_id = approval_id
+        broker_order_id = str(submit_result.get("broker_order_id") or "")
+        await store.save_intent(session, intent)
+        if broker_order_id:
+            await store.mark_intent_submitted(session, intent.intent_id, broker_order_id)
+        await store.add_audit(
+            session,
+            event_type="order_submitted",
+            actor=request.operator,
+            run_id=run_id,
+            payload={
+                "broker_order_id": broker_order_id,
+                "broker_status": submit_result.get("broker_status"),
+                "ticker": intent.ticker,
+                "quantity": intent.quantity,
+                "limit_price": intent.limit_price,
+                "message": submit_result.get("message"),
+            },
+        )
 
     # Audit the human decision only after resume completed successfully.
     await store.add_audit(

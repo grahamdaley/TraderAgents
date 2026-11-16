@@ -356,6 +356,7 @@ function InboxPanel() {
   const [qty, setQty] = useState("");
   const [limit, setLimit] = useState("");
   const [error, setError] = useState("");
+  const [notice, setNotice] = useState("");
   const [busy, setBusy] = useState(false);
 
   const refresh = useCallback(async () => {
@@ -374,12 +375,14 @@ function InboxPanel() {
     setQty(String(item.payload?.quantity ?? ""));
     setLimit(String(item.payload?.limit_price ?? ""));
     setError("");
+    setNotice("");
   }
 
   async function decide(action) {
     if (!selected) return;
     setBusy(true);
     setError("");
+    setNotice("");
     try {
       const body = {
         action,
@@ -390,12 +393,27 @@ function InboxPanel() {
         body.quantity = qty === "" ? null : Number(qty);
         body.limit_price = limit === "" ? null : Number(limit);
       }
-      await api(`/api/runs/${selected.run_id}/decision`, {
+      const result = await api(`/api/runs/${selected.run_id}/decision`, {
         method: "POST",
         body: JSON.stringify(body),
       });
+      const status = result?.status;
+      const note =
+        result?.state?.submit_result?.message ||
+        result?.state?.error ||
+        null;
       setSelected(null);
       await refresh();
+      if (status === "failed") {
+        setError(note || "Order failed — see Runs / Audit for details.");
+      } else if (status === "submitted") {
+        setNotice(
+          note ||
+            "Limit order submitted to IBKR and will work when the US market is open."
+        );
+      } else if (status === "filled") {
+        setNotice("Order filled.");
+      }
     } catch (e) {
       setError(String(e.message || e));
     } finally {
@@ -497,9 +515,12 @@ function InboxPanel() {
               </button>
             </div>
             {error ? <div className="error">{error}</div> : null}
+            {notice ? <p className="muted">{notice}</p> : null}
           </>
         )}
       </div>
+      {!selected && notice ? <p className="muted">{notice}</p> : null}
+      {!selected && error ? <div className="error">{error}</div> : null}
     </div>
   );
 }

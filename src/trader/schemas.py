@@ -238,3 +238,13 @@ class FillRecord(BaseModel):
     fill_price: float
     filled_at: datetime = Field(default_factory=utcnow)
     account_id: str
+
+
+class SubmitResult(BaseModel):
+    """Outcome of broker.submit — filled now, or resting until the session opens."""
+
+    status: Literal["filled", "submitted"]
+    broker_order_id: str
+    broker_status: str
+    fill: FillRecord | None = None
+    message: str | None = None
