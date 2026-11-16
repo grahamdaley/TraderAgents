@@ -80,7 +80,7 @@ export AWS_PROFILE=trader-ecr
 ./scripts/push-ecr.sh
 ```
 
-The script reads `awsRegion`, `apiRepositoryUrl`, and `webRepositoryUrl` from the Pulumi stack in `infra/`.
+The script reads `awsRegion`, `apiRepositoryUrl`, and `webRepositoryUrl` from the Pulumi stack in `infra/`, and builds for **linux/amd64** (override with `DOCKER_PLATFORM` if needed).
 
 ### 3. Configure the Linux box
 

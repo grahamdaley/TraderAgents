@@ -8,6 +8,7 @@
 #   AWS_PROFILE         — AWS CLI profile (e.g. trader-ecr)
 #   PULUMI_STACK        — stack name (default: current selected stack)
 #   IMAGE_TAG           — defaults to "latest"; also tags with short git sha when available
+#   DOCKER_PLATFORM     — defaults to linux/amd64 (for Linux x86_64 hosts)
 #   AWS_REGION / ECR_API_REPO_URL / ECR_WEB_REPO_URL — override Pulumi outputs
 #
 # Example:
@@ -21,6 +22,7 @@ INFRA_DIR="${ROOT}/infra"
 cd "$ROOT"
 
 IMAGE_TAG="${IMAGE_TAG:-latest}"
+DOCKER_PLATFORM="${DOCKER_PLATFORM:-linux/amd64}"
 AWS_REGION="${AWS_REGION:-${AWS_DEFAULT_REGION:-}}"
 ECR_API_REPO_URL="${ECR_API_REPO_URL:-}"
 ECR_WEB_REPO_URL="${ECR_WEB_REPO_URL:-}"
@@ -28,13 +30,13 @@ PULUMI_STACK="${PULUMI_STACK:-}"
 
 usage() {
   cat <<'EOF'
-Usage: ./scripts/push-ecr.sh [--stack STACK] [--region REGION] [--api-url URL] [--web-url URL] [--tag TAG]
+Usage: ./scripts/push-ecr.sh [--stack STACK] [--region REGION] [--api-url URL] [--web-url URL] [--tag TAG] [--platform PLATFORM]
 
-Builds the API and web Docker images and pushes them to ECR.
+Builds the API and web Docker images (default platform: linux/amd64) and pushes them to ECR.
 Region and repository URLs default to Pulumi stack outputs from infra/.
 
 Environment:
-  AWS_PROFILE, PULUMI_STACK, IMAGE_TAG
+  AWS_PROFILE, PULUMI_STACK, IMAGE_TAG, DOCKER_PLATFORM
   AWS_REGION, ECR_API_REPO_URL, ECR_WEB_REPO_URL (optional overrides)
 EOF
 }
@@ -46,6 +48,7 @@ while [[ $# -gt 0 ]]; do
     --api-url) ECR_API_REPO_URL="$2"; shift 2 ;;
     --web-url) ECR_WEB_REPO_URL="$2"; shift 2 ;;
     --tag) IMAGE_TAG="$2"; shift 2 ;;
+    --platform) DOCKER_PLATFORM="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown argument: $1" >&2; usage; exit 1 ;;
   esac
@@ -98,11 +101,11 @@ if command -v git >/dev/null 2>&1 && git -C "$ROOT" rev-parse --short HEAD >/dev
   GIT_SHA="$(git -C "$ROOT" rev-parse --short HEAD)"
 fi
 
-echo "Building API image..."
-docker build -t "trader-api:${IMAGE_TAG}" -f Dockerfile .
+echo "Building API image (${DOCKER_PLATFORM})..."
+docker build --platform "$DOCKER_PLATFORM" -t "trader-api:${IMAGE_TAG}" -f Dockerfile .
 
-echo "Building web image..."
-docker build -t "trader-web:${IMAGE_TAG}" -f web/Dockerfile web
+echo "Building web image (${DOCKER_PLATFORM})..."
+docker build --platform "$DOCKER_PLATFORM" -t "trader-web:${IMAGE_TAG}" -f web/Dockerfile web
 
 tag_and_push() {
   local local_name="$1"
