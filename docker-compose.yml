@@ -24,6 +24,8 @@ services:
       TRADING_MODE: paper
       TWS_ACCEPT_INCOMING: accept
       READ_ONLY_API: "no"
+      # If another IBKR session is open (TWS/phone/elsewhere), take over this one.
+      EXISTING_SESSION_DETECTED_ACTION: primary
       VNC_SERVER_PASSWORD: ${VNC_SERVER_PASSWORD:-trader}
     ports:
       # gnzsnz maps paper API to 4004 inside the published port mapping convention

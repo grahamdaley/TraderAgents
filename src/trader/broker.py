@@ -202,17 +202,64 @@ class IBKRAdapter:
         # Run on the IB loop so we touch IB state from the owning thread.
         pos_rows = await ib.reqPositionsAsync()
 
+        # Account base currency may be HKD (or other). IBKR then emits
+        # TotalCashValue/BuyingPower/NetLiquidation in BASE, not USD. Per-currency
+        # cash for US equity trading lives on $LEDGER-* tags.
         cash = 0.0
         buying_power = None
+        ledger_usd = None
+        total_cash_usd = None
+        total_cash_base = None
+        buying_power_usd = None
+        buying_power_base = None
         for av in ib.accountValues(account):
-            if av.tag == "TotalCashValue" and av.currency == "USD":
-                cash = float(av.value)
-            if av.tag == "BuyingPower" and av.currency == "USD":
-                buying_power = float(av.value)
+            tag = av.tag or ""
+            currency = (av.currency or "").upper()
+            try:
+                value = float(av.value)
+            except (TypeError, ValueError):
+                continue
+            if tag in {"$LEDGER-CashBalance", "$LEDGER-TotalCashBalance", "CashBalance"}:
+                if currency == "USD":
+                    ledger_usd = value
+            elif tag == "TotalCashValue":
+                if currency == "USD":
+                    total_cash_usd = value
+                elif currency in {"BASE", "HKD"}:
+                    # Remember base only as last-resort display; prefer USD ledger.
+                    if total_cash_base is None or currency == "BASE":
+                        total_cash_base = value
+            elif tag == "BuyingPower":
+                if currency == "USD":
+                    buying_power_usd = value
+                elif buying_power_base is None:
+                    buying_power_base = value
+
+        # Cash used for US equity policy/execution must be USD, not BASE/HKD NAV.
+        if total_cash_usd is not None:
+            cash = total_cash_usd
+        elif ledger_usd is not None:
+            cash = ledger_usd
+        else:
+            cash = 0.0
+            logger.warning(
+                "No USD cash row from IBKR (TotalCashValue/ledger); "
+                "base TotalCashValue=%s buying_power_base=%s",
+                total_cash_base,
+                buying_power_base,
+            )
+
+        buying_power = buying_power_usd if buying_power_usd is not None else None
 
         positions: list[PositionView] = []
         for pos in pos_rows:
             if account and getattr(pos, "account", None) not in (None, account):
+                continue
+            # Skip FX/cash ledger rows that show up as zero-qty "USD" positions.
+            sec_type = getattr(pos.contract, "secType", None)
+            if sec_type in {"CASH", "CMDTY"}:
+                continue
+            if float(pos.position) == 0:
                 continue
             positions.append(
                 PositionView(
