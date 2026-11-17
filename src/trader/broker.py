@@ -318,8 +318,8 @@ class IBKRAdapter:
         try:
             return self._run_coro(self._get_quote_async(ticker))
         except BrokerError:
-            if not allow_stale and us_equity_session_open():
-                raise
+            # Paper accounts often lack live API MD (error 10089). Prefer delayed
+            # IBKR above; if that still fails, Yahoo keeps research/execution unblocked.
             logger.warning(
                 "IBKR quote unavailable for %s; falling back to Yahoo last close",
                 ticker,
@@ -336,6 +336,13 @@ class IBKRAdapter:
             raise BrokerError(f"No fallback quote for {ticker}")
         return float(last)
 
+    @staticmethod
+    def _price_from_ticker(t: Any) -> float | None:
+        for candidate in (t.marketPrice(), t.last, t.close, getattr(t, "bid", None), getattr(t, "ask", None)):
+            if candidate and candidate == candidate and float(candidate) > 0:
+                return float(candidate)
+        return None
+
     async def _get_quote_async(self, ticker: str) -> float:
         from ib_async import Stock
 
@@ -343,14 +350,29 @@ class IBKRAdapter:
         assert ib is not None
         contract = Stock(ticker.upper(), "SMART", "USD")
         await ib.qualifyContractsAsync(contract)
-        tickers = await ib.reqTickersAsync(contract)
-        if not tickers:
-            raise BrokerError(f"No IBKR quote for {ticker}")
-        t = tickers[0]
-        for candidate in (t.marketPrice(), t.last, t.close):
-            if candidate and candidate == candidate and candidate > 0:
-                return float(candidate)
-        raise BrokerError(f"IBKR quote unavailable for {ticker}")
+
+        # 1=live, 3=delayed, 4=delayed-frozen. Live API MD often needs a paid
+        # subscription (10089); delayed is available on paper without it.
+        last_error = "no quote"
+        for md_type in (1, 3, 4):
+            try:
+                ib.reqMarketDataType(md_type)
+            except Exception:  # noqa: BLE001
+                logger.debug("reqMarketDataType(%s) failed", md_type, exc_info=True)
+            tickers = await ib.reqTickersAsync(contract)
+            if tickers:
+                price = self._price_from_ticker(tickers[0])
+                if price is not None:
+                    return price
+            # Snapshot stream as a second chance for delayed farms.
+            ticker_row = ib.reqMktData(contract, "", False, False)
+            await asyncio.sleep(1.25)
+            price = self._price_from_ticker(ticker_row)
+            ib.cancelMktData(contract)
+            if price is not None:
+                return price
+            last_error = f"md_type={md_type} empty"
+        raise BrokerError(f"IBKR quote unavailable for {ticker} ({last_error})")
 
     def submit(
         self,
