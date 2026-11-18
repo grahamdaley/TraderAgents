@@ -4,7 +4,7 @@ import asyncio
 import logging
 import math
 import threading
-from collections.abc import Coroutine
+from collections.abc import Callable, Coroutine
 from typing import Any, TypeVar
 
 from trader.config import Settings, get_settings
@@ -50,6 +50,8 @@ class IBKRAdapter:
         self.settings = settings or get_settings()
         self._ib = None
         self._lock = threading.Lock()
+        self._connect_lock = threading.Lock()
+        self._intentional_mock = False
         self._mock_cash = self.settings.starting_cash
         self._mock_positions: dict[str, float] = {}
         self._mock_orders: list[dict[str, Any]] = []
@@ -58,7 +60,7 @@ class IBKRAdapter:
 
     @property
     def using_mock(self) -> bool:
-        return self._ib is None
+        return self._intentional_mock
 
     def assert_trading_mode_safe(self) -> None:
         mode = self.settings.ibkr_trading_mode
@@ -79,14 +81,53 @@ class IBKRAdapter:
             return
         raise BrokerError(f"Unknown trading mode: {mode}")
 
+    def _is_connected(self) -> bool:
+        ib = self._ib
+        loop = self._loop
+        if ib is None or loop is None or not loop.is_running():
+            return False
+        try:
+            return bool(ib.isConnected())
+        except Exception:  # noqa: BLE001
+            return False
+
+    @staticmethod
+    def _is_disconnect_error(exc: BaseException) -> bool:
+        text = str(exc).lower()
+        needles = (
+            "not connected",
+            "disconnected",
+            "peer closed",
+            "connection reset",
+            "broken pipe",
+            "timeout",
+            "client id is already in use",
+            "already in use",
+        )
+        return any(n in text for n in needles)
+
     def connect(self) -> None:
         self.assert_trading_mode_safe()
-        if self._ib is not None:
+        if self._is_connected():
             return
         if self.settings.allow_mock_broker and not self.settings.tws_userid:
             logger.warning("IBKR credentials missing; using mock broker book")
+            self._intentional_mock = True
             return
 
+        self._intentional_mock = False
+        with self._connect_lock:
+            if self._is_connected():
+                return
+            if self._loop is not None and self._loop.is_running() and self._ib is not None:
+                # Thread still alive — reconnect on the existing loop.
+                self._reconnect_on_loop(retries=3)
+                return
+            self._start_ib_thread()
+
+    def _start_ib_thread(self) -> None:
+        # Ensure any prior half-dead thread is gone before starting another.
+        self._shutdown_ib_thread()
         ready = threading.Event()
         errors: list[BaseException] = []
 
@@ -95,27 +136,7 @@ class IBKRAdapter:
             asyncio.set_event_loop(loop)
             self._loop = loop
             try:
-                from ib_async import IB
-
-                ib = IB()
-
-                async def _connect() -> None:
-                    await ib.connectAsync(
-                        self.settings.ibkr_host,
-                        self.settings.ibkr_port,
-                        clientId=self.settings.ibkr_client_id,
-                        readonly=False,
-                        timeout=8,
-                    )
-
-                loop.run_until_complete(_connect())
-                self._ib = ib
-                logger.info(
-                    "Connected to IBKR Gateway %s:%s mode=%s",
-                    self.settings.ibkr_host,
-                    self.settings.ibkr_port,
-                    self.settings.ibkr_trading_mode,
-                )
+                loop.run_until_complete(self._connect_ib_async())
                 ready.set()
                 loop.run_forever()
             except BaseException as exc:  # noqa: BLE001
@@ -143,8 +164,101 @@ class IBKRAdapter:
         if errors:
             self.disconnect()
             raise BrokerError(f"IBKR connect failed: {errors[0]}") from errors[0]
+        if not self._is_connected():
+            self.disconnect()
+            raise BrokerError("IBKR connect finished without a live session")
 
-    def disconnect(self) -> None:
+    async def _connect_ib_async(self) -> None:
+        from ib_async import IB
+
+        # Drop any stale client before opening a new socket.
+        old = self._ib
+        if old is not None:
+            try:
+                if old.isConnected():
+                    old.disconnect()
+            except Exception:  # noqa: BLE001
+                pass
+            self._ib = None
+
+        ib = IB()
+
+        def _on_disconnected() -> None:
+            logger.warning(
+                "IBKR Gateway disconnected (host=%s port=%s); will reconnect on next use",
+                self.settings.ibkr_host,
+                self.settings.ibkr_port,
+            )
+
+        ib.disconnectedEvent += _on_disconnected
+        await ib.connectAsync(
+            self.settings.ibkr_host,
+            self.settings.ibkr_port,
+            clientId=self.settings.ibkr_client_id,
+            readonly=False,
+            timeout=8,
+        )
+        self._ib = ib
+        logger.info(
+            "Connected to IBKR Gateway %s:%s mode=%s clientId=%s",
+            self.settings.ibkr_host,
+            self.settings.ibkr_port,
+            self.settings.ibkr_trading_mode,
+            self.settings.ibkr_client_id,
+        )
+
+    def _reconnect_on_loop(self, *, retries: int = 3) -> None:
+        loop = self._loop
+        if loop is None or not loop.is_running():
+            self._start_ib_thread()
+            return
+        last_exc: BaseException | None = None
+        for attempt in range(1, retries + 1):
+            try:
+                asyncio.run_coroutine_threadsafe(
+                    self._connect_ib_async(), loop
+                ).result(timeout=30)
+                if self._is_connected():
+                    return
+            except Exception as exc:  # noqa: BLE001
+                last_exc = exc
+                logger.warning(
+                    "IBKR reconnect attempt %s/%s failed: %s",
+                    attempt,
+                    retries,
+                    exc,
+                )
+                threading.Event().wait(min(2 * attempt, 6))
+        # Loop may be wedged — full thread restart.
+        logger.warning("IBKR reconnect via loop failed; restarting IB thread")
+        self._shutdown_ib_thread()
+        try:
+            self._start_ib_thread()
+        except Exception as exc:  # noqa: BLE001
+            raise BrokerError(
+                f"IBKR reconnect failed: {last_exc or exc}"
+            ) from (last_exc or exc)
+
+    def ensure_connected(self) -> None:
+        """Reconnect after Gateway restarts / nightly re-auth without API reboot."""
+        if self._intentional_mock:
+            return
+        if self._is_connected():
+            return
+        with self._connect_lock:
+            if self._is_connected():
+                return
+            if self._intentional_mock:
+                return
+            logger.warning("IBKR session not connected; reconnecting to Gateway")
+            if self._loop is not None and self._loop.is_running():
+                self._reconnect_on_loop(retries=3)
+            else:
+                self._start_ib_thread()
+            if not self._is_connected():
+                raise BrokerError("IBKR not connected")
+
+    def _shutdown_ib_thread(self) -> None:
         loop = self._loop
         thread = self._ib_thread
         if loop is not None and loop.is_running():
@@ -171,32 +285,55 @@ class IBKRAdapter:
         self._ib_thread = None
         self._loop = None
 
+    def disconnect(self) -> None:
+        with self._connect_lock:
+            self._shutdown_ib_thread()
+
     def _run_coro(self, coro: Coroutine[Any, Any, T]) -> T:
         loop = self._loop
-        if self._ib is None or loop is None or not loop.is_running():
+        if not self._is_connected() or loop is None or not loop.is_running():
             # Coroutine was created already; close it to avoid "never awaited".
             coro.close()
             raise BrokerError("IBKR not connected")
         return asyncio.run_coroutine_threadsafe(coro, loop).result(timeout=60)
 
+    def _with_ib(self, factory: Callable[[], Coroutine[Any, Any, T]]) -> T:
+        """Run an IB coroutine factory, reconnecting once on disconnect errors."""
+        self.ensure_connected()
+        try:
+            return self._run_coro(factory())
+        except Exception as exc:  # noqa: BLE001
+            if self._intentional_mock or not self._is_disconnect_error(exc):
+                raise
+            logger.warning(
+                "IBKR call failed after disconnect (%s); retrying once", exc
+            )
+            with self._connect_lock:
+                if not self._is_connected():
+                    self._reconnect_on_loop(retries=3)
+            return self._run_coro(factory())
+
+    def _mock_book(self) -> BookSnapshot:
+        positions = [
+            PositionView(ticker=t, quantity=q, avg_cost=None, market_value=None)
+            for t, q in self._mock_positions.items()
+            if q
+        ]
+        return BookSnapshot(
+            account_id=self.settings.ibkr_account_id or "MOCK-DU",
+            cash=self._mock_cash,
+            buying_power=self._mock_cash,
+            positions=positions,
+            open_orders=list(self._mock_orders),
+            as_of=utcnow(),
+            source="mock",
+        )
+
     def get_book(self) -> BookSnapshot:
         self.assert_trading_mode_safe()
-        if self._ib is None:
-            positions = [
-                PositionView(ticker=t, quantity=q, avg_cost=None, market_value=None)
-                for t, q in self._mock_positions.items()
-                if q
-            ]
-            return BookSnapshot(
-                account_id=self.settings.ibkr_account_id or "MOCK-DU",
-                cash=self._mock_cash,
-                buying_power=self._mock_cash,
-                positions=positions,
-                open_orders=list(self._mock_orders),
-                as_of=utcnow(),
-                source="mock",
-            )
-        return self._run_coro(self._get_book_async())
+        if self._intentional_mock:
+            return self._mock_book()
+        return self._with_ib(self._get_book_async)
 
     async def _get_book_async(self) -> BookSnapshot:
         ib = self._ib
@@ -312,11 +449,11 @@ class IBKRAdapter:
 
     def get_quote(self, ticker: str, *, allow_stale: bool = False) -> float:
         self.assert_trading_mode_safe()
-        if self._ib is None:
+        if self._intentional_mock:
             return self._yahoo_last_close(ticker)
 
         try:
-            return self._run_coro(self._get_quote_async(ticker))
+            return self._with_ib(lambda: self._get_quote_async(ticker))
         except BrokerError:
             # Paper accounts often lack live API MD (error 10089). Prefer delayed
             # IBKR above; if that still fails, Yahoo keeps research/execution unblocked.
@@ -396,7 +533,7 @@ class IBKRAdapter:
                 skip_price_band=not session_open,
             )
 
-            if self._ib is None:
+            if self._intentional_mock:
                 fill = self._mock_fill(proposal, intent, live_price)
                 return SubmitResult(
                     status="filled",
@@ -405,8 +542,8 @@ class IBKRAdapter:
                     fill=fill,
                 )
 
-            return self._run_coro(
-                self._submit_async(
+            return self._with_ib(
+                lambda: self._submit_async(
                     proposal, intent, live_price, book, session_open=session_open
                 )
             )
@@ -522,9 +659,9 @@ class IBKRAdapter:
         if not queries:
             return {}
         self.assert_trading_mode_safe()
-        if self._ib is None:
+        if self._intentional_mock:
             return {}
-        return self._run_coro(self._lookup_order_outcomes_async(queries))
+        return self._with_ib(lambda: self._lookup_order_outcomes_async(queries))
 
     async def _lookup_order_outcomes_async(
         self, queries: list[dict[str, str]]
