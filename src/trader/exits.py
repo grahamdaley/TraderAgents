@@ -90,6 +90,19 @@ def _position_qty(book, ticker: str) -> float:
     return 0.0
 
 
+def working_sell_tickers(book) -> set[str]:
+    """Tickers with a resting IBKR SELL (submitted but not yet filled)."""
+    out: set[str] = set()
+    for order in book.open_orders or []:
+        side = str(order.get("side") or "").upper()
+        if side != "SELL":
+            continue
+        ticker = str(order.get("ticker") or "").upper()
+        if ticker:
+            out.add(ticker)
+    return out
+
+
 def _exit_reason(trigger: str, last_close: float | None, avg_price: float, sma50: float | None) -> str:
     if trigger == "loss":
         return (
@@ -111,7 +124,8 @@ async def review_exits(
     """Evaluate open plans.
 
     The scheduled pass writes an audit row and will not run twice on the same UTC date.
-    A manual pass still runs, and an open proposal blocks a second order for that ticker.
+    A manual pass still runs. Open Inbox proposals, in-flight runs, and resting /
+    submitted SELLs (IBKR open orders or desk intents awaiting fill) block duplicates.
     """
     async with _review_lock:
         moment = now or utcnow()
@@ -130,11 +144,23 @@ async def review_exits(
             if run.status in {"running", "awaiting_human", "processing_decision"}:
                 blocked.add(run.ticker.upper())
 
+        # Desk intents already sent to IBKR as SELL, waiting for fill.
+        pending_sells: set[str] = set()
+        for intent in await store.list_submitted_intents_without_fills(session):
+            payload = intent.payload or {}
+            if str(payload.get("side") or "").upper() != "SELL":
+                continue
+            ticker = str(payload.get("ticker") or "").upper()
+            if ticker:
+                pending_sells.add(ticker)
+
         try:
             book = get_book_snapshot()
         except Exception as exc:
             logger.exception("exit review skipped; book unavailable")
             return {"skipped": True, "date": day, "actions": [], "error": str(exc)}
+
+        pending_sells |= working_sell_tickers(book)
 
         tools = get_market_data_tools()
         actions: list[dict[str, Any]] = []
@@ -150,6 +176,9 @@ async def review_exits(
                 continue
             if ticker in blocked:
                 actions.append({"ticker": ticker, "action": "skipped_busy"})
+                continue
+            if ticker in pending_sells:
+                actions.append({"ticker": ticker, "action": "skipped_working_sell"})
                 continue
 
             indicators: dict[str, Any] = {}
