@@ -193,7 +193,11 @@ async def reconcile_submitted_fills(session: AsyncSession) -> dict[str, Any]:
             )
         except Exception as exc:  # noqa: BLE001
             logger.exception("fill reconcile broker lookup failed")
-            return {"checked": len(intents), "actions": [], "error": str(exc)}
+            return {
+                "checked": len(intents),
+                "actions": [],
+                "error": str(exc) or type(exc).__name__,
+            }
 
         actions: list[dict[str, Any]] = []
         for intent in intents:

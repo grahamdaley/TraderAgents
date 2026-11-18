@@ -289,13 +289,20 @@ class IBKRAdapter:
         with self._connect_lock:
             self._shutdown_ib_thread()
 
-    def _run_coro(self, coro: Coroutine[Any, Any, T]) -> T:
+    def _run_coro(
+        self, coro: Coroutine[Any, Any, T], *, timeout: float = 60
+    ) -> T:
         loop = self._loop
         if not self._is_connected() or loop is None or not loop.is_running():
             # Coroutine was created already; close it to avoid "never awaited".
             coro.close()
             raise BrokerError("IBKR not connected")
-        return asyncio.run_coroutine_threadsafe(coro, loop).result(timeout=60)
+        try:
+            return asyncio.run_coroutine_threadsafe(coro, loop).result(timeout=timeout)
+        except TimeoutError as exc:
+            raise BrokerError(
+                f"IBKR request timed out after {timeout:.0f}s"
+            ) from exc
 
     def _with_ib(self, factory: Callable[[], Coroutine[Any, Any, T]]) -> T:
         """Run an IB coroutine factory, reconnecting once on disconnect errors."""
@@ -661,74 +668,106 @@ class IBKRAdapter:
         self.assert_trading_mode_safe()
         if self._intentional_mock:
             return {}
-        return self._with_ib(lambda: self._lookup_order_outcomes_async(queries))
+        # Executions + open/completed orders can exceed the default 60s budget.
+        self.ensure_connected()
+        try:
+            return self._run_coro(
+                self._lookup_order_outcomes_async(queries), timeout=120
+            )
+        except Exception as exc:  # noqa: BLE001
+            if self._intentional_mock or not self._is_disconnect_error(exc):
+                raise
+            logger.warning(
+                "IBKR lookup failed after disconnect (%s); retrying once", exc
+            )
+            with self._connect_lock:
+                if not self._is_connected():
+                    self._reconnect_on_loop(retries=3)
+            return self._run_coro(
+                self._lookup_order_outcomes_async(queries), timeout=120
+            )
 
     async def _lookup_order_outcomes_async(
         self, queries: list[dict[str, str]]
     ) -> dict[str, dict[str, Any]]:
         ib = self._ib
         assert ib is not None
-        try:
-            await ib.reqAllOpenOrdersAsync()
-        except Exception:  # noqa: BLE001
-            logger.exception("reqAllOpenOrders failed during fill reconcile")
-        try:
-            # API-placed orders only — matches our orderRef client ids.
-            await ib.reqCompletedOrdersAsync(True)
-        except Exception:  # noqa: BLE001
-            logger.exception("reqCompletedOrders failed during fill reconcile")
 
-        # Completed-order status often has filled/avg wiped; executions keep the truth.
+        # Executions are the source of truth for late fills; fetch them first.
         exec_by_ref: dict[str, dict[str, Any]] = {}
+        exec_by_oid: dict[str, dict[str, Any]] = {}
         try:
             from ib_async import ExecutionFilter
 
-            fill_rows = await ib.reqExecutionsAsync(ExecutionFilter())
+            fill_rows = await asyncio.wait_for(
+                ib.reqExecutionsAsync(ExecutionFilter()), timeout=20
+            )
             for fill in fill_rows:
                 execution = fill.execution
                 ref = str(getattr(execution, "orderRef", None) or "").strip()
-                if not ref:
-                    continue
+                oid = str(execution.orderId or "")
+                if oid in {"0", "None"}:
+                    oid = ""
                 shares = float(execution.shares or 0)
                 price = float(
                     getattr(execution, "avgPrice", None) or execution.price or 0
                 )
                 if shares <= 0 or price <= 0:
                     continue
-                prev = exec_by_ref.get(ref)
-                if prev:
+                side = str(execution.side or "").upper()
+                if side in {"BOT", "BUY"}:
+                    side = "BUY"
+                elif side in {"SLD", "SELL"}:
+                    side = "SELL"
+                entry = {
+                    "broker_order_id": oid,
+                    "client_order_id": ref,
+                    "status": "Filled",
+                    "filled_qty": shares,
+                    "avg_price": price,
+                    "remaining": 0.0,
+                    "ticker": getattr(fill.contract, "symbol", "") or "",
+                    "side": side,
+                }
+
+                def _accumulate(bucket: dict[str, dict[str, Any]], key: str) -> None:
+                    prev = bucket.get(key)
+                    if not prev:
+                        bucket[key] = dict(entry)
+                        return
                     total_shares = prev["filled_qty"] + shares
                     prev["avg_price"] = (
                         prev["avg_price"] * prev["filled_qty"] + price * shares
                     ) / total_shares
                     prev["filled_qty"] = total_shares
-                    if execution.orderId:
-                        prev["broker_order_id"] = str(execution.orderId)
-                else:
-                    side = str(execution.side or "").upper()
-                    if side in {"BOT", "BUY"}:
-                        side = "BUY"
-                    elif side in {"SLD", "SELL"}:
-                        side = "SELL"
-                    exec_by_ref[ref] = {
-                        "broker_order_id": str(execution.orderId or ""),
-                        "client_order_id": ref,
-                        "status": "Filled",
-                        "filled_qty": shares,
-                        "avg_price": price,
-                        "remaining": 0.0,
-                        "ticker": getattr(fill.contract, "symbol", "") or "",
-                        "side": side,
-                    }
+                    if oid:
+                        prev["broker_order_id"] = oid
+                    if ref:
+                        prev["client_order_id"] = ref
+
+                if ref:
+                    _accumulate(exec_by_ref, ref)
+                if oid:
+                    _accumulate(exec_by_oid, oid)
         except Exception:  # noqa: BLE001
             logger.exception("reqExecutions failed during fill reconcile")
 
+        # Open/completed order status is helpful but must not hang reconcile.
+        try:
+            await asyncio.wait_for(ib.reqAllOpenOrdersAsync(), timeout=10)
+        except Exception:  # noqa: BLE001
+            logger.warning("reqAllOpenOrders timed out/failed during fill reconcile")
+        try:
+            await asyncio.wait_for(ib.reqCompletedOrdersAsync(True), timeout=10)
+        except Exception:  # noqa: BLE001
+            logger.warning("reqCompletedOrders timed out/failed during fill reconcile")
+
         by_ref: dict[str, dict[str, Any]] = dict(exec_by_ref)
-        by_id: dict[str, dict[str, Any]] = {
-            str(v["broker_order_id"]): v
-            for v in exec_by_ref.values()
-            if v.get("broker_order_id") and v["broker_order_id"] not in {"", "0"}
-        }
+        by_id: dict[str, dict[str, Any]] = dict(exec_by_oid)
+        for v in exec_by_ref.values():
+            oid = str(v.get("broker_order_id") or "")
+            if oid and oid not in by_id:
+                by_id[oid] = v
         for trade in ib.trades():
             order = trade.order
             status = trade.orderStatus
