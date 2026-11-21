@@ -345,7 +345,7 @@ def test_exit_thesis_is_a_sell_and_skips_the_committee():
 
 def test_exit_path_reaches_the_inbox(monkeypatch):
     class FakeBroker:
-        def get_book(self):
+        def get_book(self, market="us"):
             return BookSnapshot(
                 account_id="DU123",
                 cash=100_000,
@@ -354,7 +354,7 @@ def test_exit_path_reaches_the_inbox(monkeypatch):
                 ],
             )
 
-        def get_quote(self, ticker):
+        def get_quote(self, ticker, market="us", allow_stale=False):
             return 100.0
 
     monkeypatch.setattr("trader.graph.get_broker", lambda: FakeBroker())

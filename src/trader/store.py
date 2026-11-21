@@ -36,10 +36,12 @@ async def create_run(
     ticker: str,
     thread_id: str,
     nodes: dict[str, Any],
+    market: str = "us",
 ) -> RunRow:
     row = RunRow(
         id=run_id,
         ticker=ticker.upper(),
+        market=market,
         status="running",
         thread_id=thread_id,
         nodes=nodes,
@@ -115,27 +117,33 @@ def list_open_proposal_tickers_sync() -> set[str]:
         engine.dispose()
 
 
-async def list_runs(session: AsyncSession, limit: int = 50) -> list[RunRow]:
-    result = await session.execute(
-        select(RunRow).order_by(RunRow.created_at.desc()).limit(limit)
-    )
+async def list_runs(
+    session: AsyncSession, limit: int = 50, *, market: str | None = None
+) -> list[RunRow]:
+    stmt = select(RunRow).order_by(RunRow.created_at.desc()).limit(limit)
+    if market:
+        stmt = stmt.where(RunRow.market == market)
+    result = await session.execute(stmt)
     return list(result.scalars())
 
 
 async def upsert_proposal(session: AsyncSession, proposal: TradeProposal) -> ProposalRow:
     existing = await session.get(ProposalRow, proposal.proposal_id)
     payload = proposal.model_dump(mode="json")
+    market = getattr(proposal, "market", None) or "us"
     if existing:
         existing.status = proposal.status.value
         existing.content_hash = proposal.content_hash
         existing.payload = payload
         existing.expires_at = proposal.expires_at
+        existing.market = market
         row = existing
     else:
         row = ProposalRow(
             id=proposal.proposal_id,
             run_id=proposal.run_id,
             ticker=proposal.ticker,
+            market=market,
             status=proposal.status.value,
             content_hash=proposal.content_hash,
             payload=payload,
@@ -147,12 +155,17 @@ async def upsert_proposal(session: AsyncSession, proposal: TradeProposal) -> Pro
     return row
 
 
-async def list_open_proposals(session: AsyncSession) -> list[ProposalRow]:
-    result = await session.execute(
+async def list_open_proposals(
+    session: AsyncSession, *, market: str | None = None
+) -> list[ProposalRow]:
+    stmt = (
         select(ProposalRow)
         .where(ProposalRow.status == "awaiting_human")
         .order_by(ProposalRow.created_at.desc())
     )
+    if market:
+        stmt = stmt.where(ProposalRow.market == market)
+    result = await session.execute(stmt)
     return list(result.scalars())
 
 
@@ -235,6 +248,7 @@ async def save_fill(session: AsyncSession, fill: FillRecord) -> FillRow:
         intent_id=fill.intent_id,
         broker_order_id=fill.broker_order_id,
         ticker=fill.ticker,
+        market=getattr(fill, "market", None) or "us",
         side=fill.side.value,
         quantity=fill.quantity,
         fill_price=fill.fill_price,
@@ -270,6 +284,7 @@ async def save_intent_and_fill(
         intent_id=fill.intent_id,
         broker_order_id=fill.broker_order_id,
         ticker=fill.ticker,
+        market=getattr(fill, "market", None) or getattr(intent, "market", None) or "us",
         side=fill.side.value,
         quantity=fill.quantity,
         fill_price=fill.fill_price,
@@ -285,10 +300,13 @@ async def save_intent_and_fill(
     return intent_row, fill_row
 
 
-async def list_fills(session: AsyncSession, limit: int = 100) -> list[FillRow]:
-    result = await session.execute(
-        select(FillRow).order_by(FillRow.filled_at.desc()).limit(limit)
-    )
+async def list_fills(
+    session: AsyncSession, limit: int = 100, *, market: str | None = None
+) -> list[FillRow]:
+    stmt = select(FillRow).order_by(FillRow.filled_at.desc()).limit(limit)
+    if market:
+        stmt = stmt.where(FillRow.market == market)
+    result = await session.execute(stmt)
     return list(result.scalars())
 
 
@@ -327,10 +345,12 @@ async def save_scan(
     universe_count: int,
     payload: dict[str, Any],
     candidates: list[dict[str, Any]],
+    market: str = "us",
 ) -> ScanRow:
     scan_id = str(uuid4())
     scan = ScanRow(
         id=scan_id,
+        market=market,
         regime=regime,
         universe_count=universe_count,
         payload=payload,
@@ -342,6 +362,7 @@ async def save_scan(
                 id=str(uuid4()),
                 scan_id=scan_id,
                 ticker=candidate["ticker"],
+                market=market,
                 rank=int(candidate["rank"]),
                 score=float(candidate["score"]),
                 sector=candidate.get("sector") or "",
@@ -358,10 +379,13 @@ async def save_scan(
 
 async def latest_scan(
     session: AsyncSession,
+    *,
+    market: str | None = None,
 ) -> tuple[ScanRow, list[ScanCandidateRow]] | None:
-    result = await session.execute(
-        select(ScanRow).order_by(ScanRow.created_at.desc()).limit(1)
-    )
+    stmt = select(ScanRow).order_by(ScanRow.created_at.desc()).limit(1)
+    if market:
+        stmt = stmt.where(ScanRow.market == market)
+    result = await session.execute(stmt)
     scan = result.scalar_one_or_none()
     if not scan:
         return None
@@ -373,8 +397,10 @@ async def latest_scan(
     return scan, list(rows.scalars())
 
 
-async def get_open_plan(session: AsyncSession, ticker: str) -> PositionPlanRow | None:
-    result = await session.execute(
+async def get_open_plan(
+    session: AsyncSession, ticker: str, *, market: str | None = None
+) -> PositionPlanRow | None:
+    stmt = (
         select(PositionPlanRow)
         .where(
             PositionPlanRow.ticker == ticker.upper(),
@@ -382,6 +408,9 @@ async def get_open_plan(session: AsyncSession, ticker: str) -> PositionPlanRow |
         )
         .order_by(PositionPlanRow.opened_at.desc())
     )
+    if market:
+        stmt = stmt.where(PositionPlanRow.market == market)
+    result = await session.execute(stmt)
     rows = list(result.scalars())
     if not rows:
         return None
@@ -397,12 +426,17 @@ async def get_open_plan(session: AsyncSession, ticker: str) -> PositionPlanRow |
     return rows[0]
 
 
-async def list_open_plans(session: AsyncSession) -> list[PositionPlanRow]:
-    result = await session.execute(
+async def list_open_plans(
+    session: AsyncSession, *, market: str | None = None
+) -> list[PositionPlanRow]:
+    stmt = (
         select(PositionPlanRow)
         .where(PositionPlanRow.status == "open")
         .order_by(PositionPlanRow.opened_at)
     )
+    if market:
+        stmt = stmt.where(PositionPlanRow.market == market)
+    result = await session.execute(stmt)
     return list(result.scalars())
 
 
@@ -419,8 +453,10 @@ async def exit_review_done(session: AsyncSession, day: str) -> bool:
     return False
 
 
-async def autopilot_recorded(session: AsyncSession, day: str) -> bool:
-    """True only after a pass for this New York day has finished.
+async def autopilot_recorded(
+    session: AsyncSession, day: str, *, market: str = "us"
+) -> bool:
+    """True only after a pass for this market-local day has finished.
 
     A started row, a live-mode skip, or a crash before the finished audit
     does not block another attempt.
@@ -431,11 +467,16 @@ async def autopilot_recorded(session: AsyncSession, day: str) -> bool:
         select(AuditRow)
         .where(AuditRow.event_type == "autopilot_completed")
         .order_by(AuditRow.created_at.desc())
-        .limit(40)
+        .limit(80)
     )
     for row in result.scalars():
         payload = row.payload or {}
-        if payload.get("date") == day and pass_already_finished(payload):
+        payload_market = payload.get("market") or "us"
+        if (
+            payload.get("date") == day
+            and payload_market == market
+            and pass_already_finished(payload)
+        ):
             return True
     return False
 
@@ -452,8 +493,18 @@ async def list_events(
     return list(result.scalars())
 
 
-async def list_audit(session: AsyncSession, limit: int = 200) -> list[AuditRow]:
+async def list_audit(
+    session: AsyncSession, limit: int = 200, *, market: str | None = None
+) -> list[AuditRow]:
     result = await session.execute(
-        select(AuditRow).order_by(AuditRow.created_at.desc()).limit(limit)
+        select(AuditRow).order_by(AuditRow.created_at.desc()).limit(limit * 3 if market else limit)
     )
-    return list(result.scalars())
+    rows = list(result.scalars())
+    if not market:
+        return rows[:limit]
+    filtered = [
+        row
+        for row in rows
+        if ((row.payload or {}).get("market") or "us") == market
+    ]
+    return filtered[:limit]

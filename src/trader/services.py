@@ -43,6 +43,7 @@ async def start_research_run(
     session: AsyncSession,
     ticker: str,
     *,
+    market: str = "us",
     run_kind: str = "research",
     position_context: dict[str, Any] | None = None,
     exit_reason: str | None = None,
@@ -52,6 +53,7 @@ async def start_research_run(
     state = initial_state(
         run_id,
         ticker,
+        market=market,
         run_kind=run_kind,
         position_context=position_context,
         exit_reason=exit_reason,
@@ -62,12 +64,13 @@ async def start_research_run(
         ticker=ticker,
         thread_id=thread_id,
         nodes=state["nodes"],
+        market=market,
     )
     await store.add_audit(
         session,
         event_type="run_started",
         run_id=run_id,
-        payload={"ticker": ticker.upper(), "run_kind": run_kind},
+        payload={"ticker": ticker.upper(), "run_kind": run_kind, "market": market},
     )
 
     graph = get_compiled_graph()
@@ -321,5 +324,5 @@ async def maybe_auto_approve(
     }
 
 
-def get_book_snapshot():
-    return get_broker().get_book()
+def get_book_snapshot(market: str = "us"):
+    return get_broker().get_book(market)

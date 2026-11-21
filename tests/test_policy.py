@@ -139,7 +139,7 @@ def test_revalidate_sell_requires_long_and_blocks_oversized():
 
 def test_approve_with_edits_clamps_sell_to_live_long(monkeypatch):
     class FakeBroker:
-        def get_book(self):
+        def get_book(self, market="us"):
             return BookSnapshot(
                 account_id="DU123",
                 cash=100_000,

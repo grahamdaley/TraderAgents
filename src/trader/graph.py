@@ -47,6 +47,7 @@ def _merge_dicts(left: dict[str, Any], right: dict[str, Any]) -> dict[str, Any]:
 class ICState(TypedDict, total=False):
     run_id: str
     ticker: str
+    market: str
     nodes: Annotated[dict[str, Any], _merge_dicts]
     fundamentals_report: dict[str, Any] | None
     technicals_report: dict[str, Any] | None
@@ -407,7 +408,7 @@ def sentiment_node(state: ICState) -> dict[str, Any]:
 def macro_node(state: ICState) -> dict[str, Any]:
     nodes = _mark(state.get("nodes", {}), "macro", NodeStatus.RUNNING)
     tools = get_market_data_tools()
-    data = tools.get_macro_snapshot()
+    data = tools.get_macro_snapshot(market=str(state.get("market") or "us"))
     citation_ids = []
     if data.get("citation"):
         citation_ids.append(data["citation"]["source_id"])
@@ -507,10 +508,11 @@ def policy_node(state: ICState) -> dict[str, Any]:
     nodes = _mark(state.get("nodes", {}), "policy", NodeStatus.RUNNING)
     thesis = PmThesis.model_validate(state["pm_thesis"])
     risk = RiskNarrative.model_validate(state["risk_narrative"])
+    market = str(state.get("market") or "us")
     broker = get_broker()
-    book = broker.get_book()
+    book = broker.get_book(market)
     try:
-        reference_price = broker.get_quote(state["ticker"])
+        reference_price = broker.get_quote(state["ticker"], market=market)
     except Exception:  # noqa: BLE001
         indicators = get_market_data_tools().compute_indicators(state["ticker"])
         reference_price = float(
@@ -527,6 +529,7 @@ def policy_node(state: ICState) -> dict[str, Any]:
             model_ids=state.get("model_ids") or {},
             citation_ids=list(dict.fromkeys(state.get("citation_ids") or [])),
             open_proposal_tickers=list_open_proposal_tickers_sync(),
+            market=market,
         )
         nodes = _mark(nodes, "policy", NodeStatus.DONE)
         return {
@@ -579,18 +582,24 @@ def execute_node(state: ICState) -> dict[str, Any]:
 
     nodes = _mark(state.get("nodes", {}), "execute", NodeStatus.RUNNING)
     proposal = TradeProposal.model_validate(state["trade_proposal"])
+    market = str(state.get("market") or proposal.market or "us")
+    proposal.market = market  # type: ignore[assignment]
     if action == "approve_with_edits":
         if decision.get("quantity") is not None:
-            # Whole shares only — IBKR API rejects fractional US stock sizes.
-            proposal.quantity = float(int(float(decision["quantity"])))
+            from trader.markets import lot_size_for, round_to_lot
+
+            lot = lot_size_for(proposal.ticker, market)
+            proposal.quantity = round_to_lot(float(decision["quantity"]), lot)
         if decision.get("limit_price") is not None:
             proposal.limit_price = round(float(decision["limit_price"]), 2)
         # SELL stays at or under the live long; oversized edits are clamped.
         if proposal.side == Side.SELL:
-            book = get_broker().get_book()
+            from trader.markets import tickers_match
+
+            book = get_broker().get_book(market)
             live_qty = 0.0
             for pos in book.positions:
-                if pos.ticker.upper() == proposal.ticker.upper():
+                if tickers_match(pos.ticker, proposal.ticker, market):
                     live_qty = float(pos.quantity)
                     break
             if live_qty <= 0:
@@ -616,6 +625,7 @@ def execute_node(state: ICState) -> dict[str, Any]:
         approval_id=decision.get("approval_id") or str(uuid4()),
         content_hash=proposal.content_hash,
         ticker=proposal.ticker,
+        market=market,  # type: ignore[arg-type]
         side=proposal.side,
         quantity=proposal.quantity,
         order_type=proposal.order_type,
@@ -805,6 +815,7 @@ def initial_state(
     run_id: str,
     ticker: str,
     *,
+    market: str = "us",
     run_kind: str = "research",
     position_context: dict[str, Any] | None = None,
     exit_reason: str | None = None,
@@ -823,6 +834,7 @@ def initial_state(
     return {
         "run_id": run_id,
         "ticker": ticker.upper(),
+        "market": market,
         "nodes": {
             name: NodeState(name=name).model_dump(mode="json") for name in node_names
         },

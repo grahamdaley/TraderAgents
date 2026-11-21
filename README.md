@@ -1,13 +1,16 @@
 # Research desk with human-confirmed paper trading
 
-LangGraph investment committee that researches US equities, pauses for human approval in a local operator console, and submits approved orders to an IBKR paper account via IB Gateway.
+LangGraph investment committee that researches **US and Hong Kong** equities, pauses for human approval in a local operator console, and submits approved orders to an IBKR paper account via IB Gateway.
 
 ## Architecture
 
+- **Markets**: separate US (`/us`) and Hong Kong (`/hk`) desks — SMART/USD and SEHK/HKD
 - **Research**: yfinance for statements, ratios, news, and daily bars
+- **Universes**: S&P 100 (`config/universe.csv`); HSI + Hang Seng TECH (`config/universe-hk.csv`)
 - **Decision**: four specialist agents → portfolio manager → risk narrative → deterministic policy
-- **HITL**: operator console (approve / edit / reject)
+- **HITL**: operator console (approve / edit / reject) with a market switcher
 - **Execution**: IBKR paper Gateway only in phase 1 (`IBKR_LIVE_ORDERS_ENABLED=false`)
+- **Autopilot**: optional paper pass after each venue’s open (`America/New_York` and `Asia/Hong_Kong`)
 - **Models**: Nous Portal OpenAI-compatible API
 
 ## Quick start

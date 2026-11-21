@@ -13,7 +13,7 @@ from typing import Any
 import pandas as pd
 import yfinance as yf
 
-from trader.config import CONFIG_DIR
+from trader.markets import MarketId, get_market, parse_market
 from trader.tools.market_data import (
     MarketDataTools,
     get_market_data_tools,
@@ -31,12 +31,17 @@ EARNINGS_WINDOW_DAYS = 3
 DEBT_TO_EQUITY_MAX = 150.0
 
 
-def load_universe(path=None) -> list[dict[str, str]]:
-    source = path or (CONFIG_DIR / "universe.csv")
+def load_universe(path=None, market: MarketId | str = "us") -> list[dict[str, str]]:
+    mid = parse_market(str(market))
+    spec = get_market(mid)
+    source = path or spec.universe_path
     if not source.exists():
-        raise FileNotFoundError(
-            f"{source} is missing. Run `python -m trader.refresh_universe` and commit the file."
+        hint = (
+            "python -m trader.refresh_universe_hk"
+            if mid == "hk"
+            else "python -m trader.refresh_universe"
         )
+        raise FileNotFoundError(f"{source} is missing. Run `{hint}` and commit the file.")
     frame = pd.read_csv(source, dtype=str).fillna("")
     rows = []
     for record in frame.to_dict(orient="records"):
@@ -44,11 +49,13 @@ def load_universe(path=None) -> list[dict[str, str]]:
         sector = str(record.get("sector") or "").strip().upper()
         if not ticker or not sector:
             continue
+        lot_raw = str(record.get("lot_size") or "").strip()
         rows.append(
             {
                 "ticker": ticker,
                 "name": str(record.get("name") or "").strip(),
                 "sector": sector,
+                "lot_size": lot_raw,
             }
         )
     if not rows:
@@ -459,8 +466,35 @@ def _enrich_shortlist(rows: list[dict[str, Any]], tools: MarketDataTools) -> Non
         row["headlines"] = headlines
 
 
+def _hot_sectors_from_peers(
+    prepared: list[dict[str, Any]],
+    index_features: dict[str, Any],
+    *,
+    n: int = 3,
+) -> set[str]:
+    """Sector median 1m return vs index — used when venue has no SPDR-style ETFs."""
+    by_sector: dict[str, list[float]] = {}
+    for row in prepared:
+        sector = row.get("sector") or ""
+        features = row.get("features") or {}
+        ret = features.get("return_1m")
+        if not sector or ret is None:
+            continue
+        by_sector.setdefault(sector, []).append(float(ret))
+    if not by_sector:
+        return set()
+    index_1m = float(index_features.get("return_1m") or 0.0)
+    ranked = sorted(
+        by_sector,
+        key=lambda sector: (sum(by_sector[sector]) / len(by_sector[sector])) - index_1m,
+        reverse=True,
+    )
+    return set(ranked[:n])
+
+
 def run_scan(
     *,
+    market: MarketId | str = "us",
     universe: list[dict[str, str]] | None = None,
     held_tickers: set[str] | None = None,
     hold_tickers: set[str] | None = None,
@@ -468,7 +502,9 @@ def run_scan(
     tools: MarketDataTools | None = None,
 ) -> dict[str, Any]:
     """Full scan. Network I/O stays in this function so scoring tests stay offline."""
-    universe = universe if universe is not None else load_universe()
+    mid = parse_market(str(market))
+    spec = get_market(mid)
+    universe = universe if universe is not None else load_universe(market=mid)
     tools = tools or get_market_data_tools()
     held_tickers = {t.upper() for t in (held_tickers or set())}
     hold_tickers = {t.upper() for t in (hold_tickers or set())}
@@ -476,26 +512,38 @@ def run_scan(
     held_sectors = {sector_by_ticker[t] for t in held_tickers if t in sector_by_ticker}
 
     symbols = [row["ticker"] for row in universe]
-    extra = [*SECTOR_ETFS, "^GSPC"]
+    index_symbol = spec.regime_index_symbol
+    vol_symbol = spec.regime_vol_symbol
+    if mid == "us":
+        extra = [*SECTOR_ETFS, index_symbol]
+    else:
+        extra = [index_symbol, vol_symbol]
     bars = download_bars(symbols + extra)
-    macro = macro if macro is not None else tools.get_macro_snapshot()
+    macro = macro if macro is not None else tools.get_macro_snapshot(market=mid)
     regime = classify_regime(macro.get("vix"), macro.get("spx_1m_return"))
 
-    market_bars = bars.get("^GSPC")
-    market = bar_features(market_bars) if market_bars is not None else {}
-    if not market:
-        market = {"return_1m": macro.get("spx_1m_return") or 0.0, "return_3m": 0.0}
-    etf_features = {}
-    for etf in SECTOR_ETFS:
-        features = bar_features(bars[etf]) if etf in bars else None
-        if features:
-            etf_features[etf] = features
-    hot = set(leading_sectors(etf_features, market)) if etf_features else set()
+    market_bars = bars.get(index_symbol)
+    index_features = bar_features(market_bars) if market_bars is not None else {}
+    if not index_features:
+        index_features = {
+            "return_1m": macro.get("spx_1m_return") or 0.0,
+            "return_3m": 0.0,
+        }
 
     prepared = []
     for row in universe:
         features = bar_features(bars[row["ticker"]]) if row["ticker"] in bars else None
         prepared.append({**row, "features": features or {}})
+
+    if mid == "us":
+        etf_features = {}
+        for etf in SECTOR_ETFS:
+            features = bar_features(bars[etf]) if etf in bars else None
+            if features:
+                etf_features[etf] = features
+        hot = set(leading_sectors(etf_features, index_features)) if etf_features else set()
+    else:
+        hot = _hot_sectors_from_peers(prepared, index_features)
 
     scored = rank_universe(
         prepared,
@@ -526,4 +574,5 @@ def run_scan(
         "universe_count": len(universe),
         "hot_sectors": sorted(hot),
         "candidates": candidates,
+        "market": mid,
     }

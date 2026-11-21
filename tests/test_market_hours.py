@@ -1,7 +1,7 @@
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-from trader.market_hours import us_equity_session_open
+from trader.market_hours import equity_session_open, us_equity_session_open
 
 _NY = ZoneInfo("America/New_York")
 
@@ -9,6 +9,7 @@ _NY = ZoneInfo("America/New_York")
 def test_us_equity_session_open_weekday_rth():
     noon = datetime(2026, 11, 16, 12, 0, tzinfo=_NY)  # Monday
     assert us_equity_session_open(noon) is True
+    assert equity_session_open("us", noon) is True
 
 
 def test_us_equity_session_closed_overnight():

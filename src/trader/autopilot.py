@@ -21,6 +21,8 @@ from trader import store
 from trader.config import Settings, get_settings
 from trader.db import get_engine, get_session_factory
 from trader.exits import review_exits
+from trader.market_hours import market_local_day
+from trader.markets import MARKETS, MarketId, get_market, parse_market
 from trader.scanner import load_universe, run_scan
 from trader.services import get_book_snapshot, maybe_auto_approve, start_research_run
 
@@ -29,6 +31,7 @@ logger = logging.getLogger(__name__)
 _NY = ZoneInfo("America/New_York")
 _CONVICTION_RANK = {"LOW": 0, "MEDIUM": 1, "HIGH": 2}
 _LOCK_NAMESPACE = 481_516_234
+_LOCK_NAMESPACE_HK = 481_516_235
 _autopilot_lock = asyncio.Lock()
 
 
@@ -120,35 +123,56 @@ def _as_ny(now: datetime) -> datetime:
     return now.astimezone(_NY)
 
 
-def slot_on(now: datetime, minutes_after_open: int) -> datetime:
-    local = _as_ny(now)
+def _as_market(now: datetime, market: MarketId | str) -> datetime:
+    spec = get_market(market)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=UTC)
+    return now.astimezone(spec.timezone)
+
+
+def slot_on(
+    now: datetime, minutes_after_open: int, *, market: MarketId | str = "us"
+) -> datetime:
+    local = _as_market(now, market)
     open_at = local.replace(hour=9, minute=30, second=0, microsecond=0)
     return open_at + timedelta(minutes=max(0, int(minutes_after_open)))
 
 
-def autopilot_window_open(now: datetime, minutes_after_open: int) -> bool:
-    local = _as_ny(now)
+def autopilot_window_open(
+    now: datetime, minutes_after_open: int, *, market: MarketId | str = "us"
+) -> bool:
+    local = _as_market(now, market)
     if local.weekday() >= 5:
         return False
-    return local >= slot_on(local, minutes_after_open)
+    return local >= slot_on(local, minutes_after_open, market=market)
 
 
-def next_autopilot_at(now: datetime, minutes_after_open: int) -> datetime:
+def next_autopilot_at(
+    now: datetime, minutes_after_open: int, *, market: MarketId | str = "us"
+) -> datetime:
     """Next weekday slot strictly after `now` once today's slot has passed."""
-    local = _as_ny(now)
-    slot = slot_on(local, minutes_after_open)
+    local = _as_market(now, market)
+    slot = slot_on(local, minutes_after_open, market=market)
     if local < slot and slot.weekday() < 5:
         return slot
     day = local + timedelta(days=1)
-    slot = slot_on(day, minutes_after_open)
+    slot = slot_on(day, minutes_after_open, market=market)
     while slot.weekday() >= 5:
         day = day + timedelta(days=1)
-        slot = slot_on(day, minutes_after_open)
+        slot = slot_on(day, minutes_after_open, market=market)
     return slot
 
 
 def _ny_day(now: datetime) -> str:
     return _as_ny(now).date().isoformat()
+
+
+def _market_day(now: datetime, market: MarketId | str) -> str:
+    return market_local_day(market, now)
+
+
+def _lock_namespace(market: MarketId | str) -> int:
+    return _LOCK_NAMESPACE_HK if parse_market(str(market)) == "hk" else _LOCK_NAMESPACE
 
 
 def _hold_tickers(runs: list[Any]) -> set[str]:
@@ -184,30 +208,31 @@ def proposal_expired(proposal: dict[str, Any] | None, now: datetime) -> bool:
     return moment > expires
 
 
-def _ran_today(runs: list[Any], day: str) -> set[str]:
+def _ran_today(runs: list[Any], day: str, *, market: MarketId | str = "us") -> set[str]:
     found: set[str] = set()
     for run in runs:
         created = getattr(run, "created_at", None)
         if created is None:
             continue
-        if _ny_day(created) == day:
+        if _market_day(created, market) == day:
             found.add(str(run.ticker).upper())
     return found
 
 
 @asynccontextmanager
-async def autopilot_db_lock(day: str):
-    """Hold a Postgres advisory lock for this New York day.
+async def autopilot_db_lock(day: str, *, market: MarketId | str = "us"):
+    """Hold a Postgres advisory lock for this market-local day.
 
     The lock sits on its own connection, so commits inside the pass do not
     release it. A second process gets False until this one unlocks or dies.
     """
     key = int(day.replace("-", ""))
+    namespace = _lock_namespace(market)
     engine = get_engine()
     async with engine.connect() as conn:
         locked = await conn.scalar(
             text("SELECT pg_try_advisory_lock(:k1, :k2)"),
-            {"k1": _LOCK_NAMESPACE, "k2": key},
+            {"k1": namespace, "k2": key},
         )
         await conn.commit()
         try:
@@ -216,19 +241,23 @@ async def autopilot_db_lock(day: str):
             if locked:
                 await conn.execute(
                     text("SELECT pg_advisory_unlock(:k1, :k2)"),
-                    {"k1": _LOCK_NAMESPACE, "k2": key},
+                    {"k1": namespace, "k2": key},
                 )
                 await conn.commit()
 
 
-async def _buys_already_used(session: AsyncSession, day: str) -> int:
+async def _buys_already_used(
+    session: AsyncSession, day: str, *, market: MarketId | str = "us"
+) -> int:
     """Buy approvals already recorded today, so a retry does not raise the cap."""
     count = 0
     for row in await store.list_events(session, "auto_decision", limit=100):
         created = row.created_at
-        if created is None or _ny_day(created) != day:
+        if created is None or _market_day(created, market) != day:
             continue
         payload = row.payload or {}
+        if (payload.get("market") or "us") != parse_market(str(market)):
+            continue
         if not str(payload.get("action") or "").startswith("approve"):
             continue
         if str(payload.get("side") or "").upper() == "BUY":
@@ -260,21 +289,35 @@ async def run_autopilot_pass(
     *,
     now: datetime | None = None,
     settings: Settings | None = None,
+    market: MarketId | str = "us",
 ) -> dict[str, Any]:
-    """One New York session: exits, scan, research, immediate approve.
+    """One market session: exits, scan, research, immediate approve.
 
     The finished audit is written only after the attempt ends. A crash before
     that, or a live-mode skip, leaves the day open for another try.
     """
+    mid = parse_market(str(market))
     async with _autopilot_lock:
         moment = now or datetime.now(UTC)
         settings = settings or get_settings()
-        day = _ny_day(moment)
-        if await store.autopilot_recorded(session, day):
-            return {"skipped": True, "date": day, "reason": "already_ran", "actions": []}
+        day = _market_day(moment, mid)
+        if await store.autopilot_recorded(session, day, market=mid):
+            return {
+                "skipped": True,
+                "date": day,
+                "market": mid,
+                "reason": "already_ran",
+                "actions": [],
+            }
 
         if not settings.auto_trade_enabled:
-            return {"skipped": True, "date": day, "reason": "disabled", "actions": []}
+            return {
+                "skipped": True,
+                "date": day,
+                "market": mid,
+                "reason": "disabled",
+                "actions": [],
+            }
 
         if not autopilot_armed(settings):
             await store.add_audit(
@@ -283,31 +326,40 @@ async def run_autopilot_pass(
                 actor="autopilot",
                 payload={
                     "date": day,
+                    "market": mid,
                     "reason": "refused unless paper mode with live orders disabled",
                     "trading_mode": settings.ibkr_trading_mode,
                     "live_orders_enabled": settings.ibkr_live_orders_enabled,
                 },
             )
-            return {"skipped": True, "date": day, "reason": "not_armed", "actions": []}
+            return {
+                "skipped": True,
+                "date": day,
+                "market": mid,
+                "reason": "not_armed",
+                "actions": [],
+            }
 
-        async with autopilot_db_lock(day) as locked:
+        async with autopilot_db_lock(day, market=mid) as locked:
             if not locked:
                 return {
                     "skipped": True,
                     "date": day,
+                    "market": mid,
                     "reason": "in_progress",
                     "actions": [],
                 }
-            if await store.autopilot_recorded(session, day):
+            if await store.autopilot_recorded(session, day, market=mid):
                 return {
                     "skipped": True,
                     "date": day,
+                    "market": mid,
                     "reason": "already_ran",
                     "actions": [],
                 }
 
             return await _run_locked_pass(
-                session, moment=moment, day=day, settings=settings
+                session, moment=moment, day=day, settings=settings, market=mid
             )
 
 
@@ -317,9 +369,10 @@ async def _run_locked_pass(
     moment: datetime,
     day: str,
     settings: Settings,
+    market: MarketId = "us",
 ) -> dict[str, Any]:
     actions: list[dict[str, Any]] = []
-    buys_used = await _buys_already_used(session, day)
+    buys_used = await _buys_already_used(session, day, market=market)
     error: str | None = None
     try:
         await review_exits(
@@ -327,8 +380,9 @@ async def _run_locked_pass(
             now=moment,
             scheduled=True,
             include_horizon=False,
+            market=market,
         )
-        waiting = await store.list_runs(session, limit=200)
+        waiting = await store.list_runs(session, limit=200, market=market)
         for run in waiting:
             if getattr(run, "status", None) != "awaiting_human":
                 continue
@@ -338,6 +392,7 @@ async def _run_locked_pass(
             proposal = state.get("trade_proposal") or {}
             entry = {
                 "ticker": getattr(run, "ticker", ""),
+                "market": market,
                 "action": "exit_proposal",
                 "run_id": getattr(run, "id", None),
                 "status": "awaiting_human",
@@ -368,7 +423,7 @@ async def _run_locked_pass(
 
         held: set[str] = set()
         try:
-            book = get_book_snapshot()
+            book = get_book_snapshot(market)
             held = {
                 p.ticker.upper()
                 for p in book.positions
@@ -378,10 +433,11 @@ async def _run_locked_pass(
             logger.warning("autopilot scan continuing without book: %s", exc)
             actions.append({"action": "book_unavailable", "error": str(exc)})
 
-        recent = await store.list_runs(session, limit=200)
-        universe = load_universe()
+        recent = await store.list_runs(session, limit=200, market=market)
+        universe = load_universe(market=market)
         result = await asyncio.to_thread(
             run_scan,
+            market=market,
             universe=universe,
             held_tickers=held,
             hold_tickers=_hold_tickers(recent),
@@ -390,20 +446,22 @@ async def _run_locked_pass(
             session,
             regime=result["regime"],
             universe_count=result["universe_count"],
-            payload={"hot_sectors": result.get("hot_sectors") or []},
+            payload={"hot_sectors": result.get("hot_sectors") or [], "market": market},
             candidates=result["candidates"],
+            market=market,
         )
         actions.append(
             {
                 "action": "scan",
+                "market": market,
                 "scan_id": scan.id,
                 "candidates": len(result["candidates"]),
             }
         )
 
-        open_rows = await store.list_open_proposals(session)
+        open_rows = await store.list_open_proposals(session, market=market)
         blocked = {row.ticker.upper() for row in open_rows}
-        blocked |= _ran_today(recent, day)
+        blocked |= _ran_today(recent, day, market=market)
         chosen = select_research_names(
             result["candidates"],
             limit=settings.auto_research_top_n,
@@ -414,15 +472,21 @@ async def _run_locked_pass(
         for row in chosen:
             ticker = str(row["ticker"]).upper()
             try:
-                started = await start_research_run(session, ticker)
+                started = await start_research_run(session, ticker, market=market)
             except Exception as exc:  # noqa: BLE001
                 logger.exception("autopilot research failed for %s", ticker)
                 actions.append(
-                    {"ticker": ticker, "action": "research_error", "error": str(exc)}
+                    {
+                        "ticker": ticker,
+                        "market": market,
+                        "action": "research_error",
+                        "error": str(exc),
+                    }
                 )
                 continue
             entry = {
                 "ticker": ticker,
+                "market": market,
                 "action": "research",
                 "run_id": started.get("run_id"),
                 "status": started.get("status"),
@@ -457,6 +521,7 @@ async def _run_locked_pass(
         actor="autopilot",
         payload={
             "date": day,
+            "market": market,
             "phase": "finished",
             "actions": actions,
             "buys": buys_used,
@@ -466,6 +531,7 @@ async def _run_locked_pass(
     return {
         "skipped": False,
         "date": day,
+        "market": market,
         "reason": "finished",
         "actions": actions,
         "error": error,
@@ -473,33 +539,43 @@ async def _run_locked_pass(
 
 
 async def autopilot_loop() -> None:
-    """Weekday pass after the US open. A finished pass is not repeated that day."""
+    """Weekday pass after each market open. A finished pass is not repeated that day."""
     while True:
         try:
             settings = get_settings()
             now = datetime.now(UTC)
             minutes = settings.auto_trade_minutes_after_open
-            if autopilot_window_open(now, minutes):
+            due: list[MarketId] = [
+                mid
+                for mid in MARKETS
+                if autopilot_window_open(now, minutes, market=mid)
+            ]
+            if due:
                 factory = get_session_factory()
+                any_in_progress = False
                 async with factory() as session:
-                    result = await run_autopilot_pass(
-                        session, now=now, settings=settings
-                    )
-                if result.get("reason") == "in_progress":
+                    for mid in due:
+                        result = await run_autopilot_pass(
+                            session, now=now, settings=settings, market=mid
+                        )
+                        if result.get("reason") == "in_progress":
+                            any_in_progress = True
+                if any_in_progress:
                     delay = 30.0
                 else:
+                    next_slots = [
+                        next_autopilot_at(datetime.now(UTC), minutes, market=mid)
+                        for mid in MARKETS
+                    ]
                     delay = max(
                         60.0,
-                        (
-                            next_autopilot_at(datetime.now(UTC), minutes)
-                            - datetime.now(UTC)
-                        ).total_seconds(),
+                        (min(next_slots) - datetime.now(UTC)).total_seconds(),
                     )
             else:
-                delay = max(
-                    1.0,
-                    (next_autopilot_at(now, minutes) - now).total_seconds(),
-                )
+                next_slots = [
+                    next_autopilot_at(now, minutes, market=mid) for mid in MARKETS
+                ]
+                delay = max(1.0, (min(next_slots) - now).total_seconds())
             await asyncio.sleep(delay)
         except asyncio.CancelledError:
             raise

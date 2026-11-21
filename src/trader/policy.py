@@ -4,6 +4,13 @@ import math
 from datetime import timedelta
 
 from trader.config import Settings, get_settings
+from trader.markets import (
+    MarketId,
+    lot_size_for,
+    parse_market,
+    round_to_lot,
+    tickers_match,
+)
 from trader.schemas import (
     BookSnapshot,
     PmThesis,
@@ -22,9 +29,11 @@ class PolicyRejection(Exception):
         self.checks = checks
 
 
-def _position_qty(book: BookSnapshot, ticker: str) -> float:
+def _position_qty(
+    book: BookSnapshot, ticker: str, market: MarketId | str = "us"
+) -> float:
     for pos in book.positions:
-        if pos.ticker.upper() == ticker.upper():
+        if tickers_match(pos.ticker, ticker, market):
             return float(pos.quantity)
     return 0.0
 
@@ -40,8 +49,10 @@ def build_trade_proposal(
     citation_ids: list[str],
     open_proposal_tickers: set[str] | None = None,
     settings: Settings | None = None,
+    market: MarketId | str = "us",
 ) -> TradeProposal:
     settings = settings or get_settings()
+    mid = parse_market(str(market))
     checks: list[PolicyCheck] = []
     ticker = thesis.ticker.upper()
     open_proposal_tickers = open_proposal_tickers or set()
@@ -125,9 +136,11 @@ def build_trade_proposal(
         raise PolicyRejection("Invalid reference price", checks)
 
     target_notional = nav * size_pct
-    # IBKR API rejects fractional US stock orders (error 10243).
-    quantity = float(math.floor(target_notional / reference_price))
-    current_qty = _position_qty(book, ticker)
+    lot = lot_size_for(ticker, mid)
+    # Round down to board lot (US lot=1 → whole shares; IBKR rejects fractions).
+    raw_qty = target_notional / reference_price
+    quantity = round_to_lot(raw_qty, lot)
+    current_qty = _position_qty(book, ticker, mid)
 
     if thesis.side == Side.BUY:
         notional = quantity * reference_price
@@ -137,8 +150,8 @@ def build_trade_proposal(
                     name="cash_check",
                     passed=False,
                     detail=(
-                        f"Need ~{target_notional:.2f} ({quantity} whole shares), "
-                        f"cash={book.cash:.2f}"
+                        f"Need ~{target_notional:.2f} ({quantity} shares, lot={lot}), "
+                        f"cash={book.cash:.2f} {book.currency}"
                     ),
                 )
             )
@@ -147,7 +160,10 @@ def build_trade_proposal(
             PolicyCheck(
                 name="cash_check",
                 passed=True,
-                detail=f"Cash {book.cash:.2f} covers {quantity} shares (~{notional:.2f})",
+                detail=(
+                    f"Cash {book.cash:.2f} {book.currency} covers {quantity} shares "
+                    f"(~{notional:.2f}, lot={lot})"
+                ),
             )
         )
     elif thesis.side == Side.SELL:
@@ -160,7 +176,7 @@ def build_trade_proposal(
                 )
             )
             raise PolicyRejection("SELL requires an existing long position", checks)
-        quantity = float(math.floor(current_qty))
+        quantity = round_to_lot(current_qty, lot) or float(math.floor(current_qty))
         if nav > 0:
             size_pct = min(1.0, (quantity * reference_price) / nav)
         checks.append(
@@ -176,7 +192,7 @@ def build_trade_proposal(
             PolicyCheck(
                 name="quantity_positive",
                 passed=False,
-                detail="Computed whole-share quantity is zero",
+                detail=f"Computed lot quantity is zero (lot={lot})",
             )
         )
         raise PolicyRejection("Quantity is zero", checks)
@@ -188,6 +204,7 @@ def build_trade_proposal(
     proposal = TradeProposal(
         run_id=run_id,
         ticker=ticker,
+        market=mid,
         side=thesis.side,
         quantity=quantity,
         size_pct_nav=size_pct,
@@ -236,12 +253,13 @@ def revalidate_for_execution(
         )
     checks.append(PolicyCheck(name="ttl", passed=True, detail="Within TTL"))
 
+    mid = parse_market(getattr(proposal, "market", None) or "us")
     if skip_price_band:
         checks.append(
             PolicyCheck(
                 name="price_band",
                 passed=True,
-                detail="Skipped outside US regular hours; limit order will rest at IBKR",
+                detail="Skipped outside regular hours; limit order will rest at IBKR",
             )
         )
     else:
@@ -302,7 +320,7 @@ def revalidate_for_execution(
             )
         )
     elif proposal.side == Side.SELL:
-        current_qty = _position_qty(book, proposal.ticker)
+        current_qty = _position_qty(book, proposal.ticker, mid)
         if current_qty <= 0:
             raise PolicyRejection(
                 "SELL requires an existing long position",

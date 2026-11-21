@@ -38,6 +38,12 @@ async def record_fill_on_plan(session: AsyncSession, values: dict[str, Any]) -> 
     fill = values.get("fill") or {}
     side = str(fill.get("side") or "")
     ticker = str(fill.get("ticker") or "").upper()
+    market = str(
+        fill.get("market")
+        or values.get("market")
+        or (values.get("trade_proposal") or {}).get("market")
+        or "us"
+    )
     try:
         qty = float(fill.get("quantity") or 0)
         price = float(fill.get("fill_price") or 0)
@@ -46,7 +52,7 @@ async def record_fill_on_plan(session: AsyncSession, values: dict[str, Any]) -> 
     if not ticker or qty <= 0 or price <= 0:
         return
 
-    existing = await store.get_open_plan(session, ticker)
+    existing = await store.get_open_plan(session, ticker, market=market)
     now = utcnow()
     if side == "BUY":
         thesis = values.get("pm_thesis") or {}
@@ -63,6 +69,7 @@ async def record_fill_on_plan(session: AsyncSession, values: dict[str, Any]) -> 
             existing.review_after = now + timedelta(days=horizon)
             existing.thesis_summary = summary or existing.thesis_summary
             existing.run_id = run_id or existing.run_id
+            existing.market = market
             if sma50 is not None:
                 existing.entry_sma50 = float(sma50)
         else:
@@ -70,6 +77,7 @@ async def record_fill_on_plan(session: AsyncSession, values: dict[str, Any]) -> 
                 PositionPlanRow(
                     id=str(uuid4()),
                     ticker=ticker,
+                    market=market,
                     run_id=run_id,
                     quantity=qty,
                     avg_price=price,
@@ -111,6 +119,7 @@ def plan_to_dict(row: PositionPlanRow) -> dict[str, Any]:
     return {
         "id": row.id,
         "ticker": row.ticker,
+        "market": getattr(row, "market", None) or "us",
         "run_id": row.run_id,
         "quantity": row.quantity,
         "avg_price": row.avg_price,

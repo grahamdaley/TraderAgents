@@ -2,11 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import re
 from contextlib import asynccontextmanager
 from typing import Any
 
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -18,6 +17,7 @@ from trader.db import get_session_factory, init_db
 from trader.autopilot import autopilot_armed, autopilot_loop
 from trader.exits import exit_review_loop, review_exits
 from trader.fills import fill_reconcile_loop, reconcile_submitted_fills
+from trader.markets import normalize_ticker, parse_market
 from trader.nous import NousCatalogError, verify_configured_models
 from trader.positions import plan_to_dict
 from trader.scanner import load_universe, run_scan
@@ -85,6 +85,11 @@ app.add_middleware(
 
 class StartRunRequest(BaseModel):
     ticker: str = Field(min_length=1, max_length=16)
+    market: str = Field(default="us")
+
+
+class ScanRequest(BaseModel):
+    market: str = Field(default="us")
 
 
 @app.get("/api/health")
@@ -110,31 +115,48 @@ async def models() -> dict[str, str]:
 async def create_run(
     body: StartRunRequest, session: AsyncSession = Depends(get_session)
 ) -> dict[str, Any]:
-    ticker = body.ticker.strip().upper()
-    if not re.fullmatch(r"[A-Z0-9.\-]+", ticker):
-        raise HTTPException(400, "ticker must be letters, digits, or a class separator")
     try:
-        return await start_research_run(session, ticker)
+        market = parse_market(body.market)
+        ticker = normalize_ticker(body.ticker, market)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    try:
+        return await start_research_run(session, ticker, market=market)
     except Exception as exc:  # noqa: BLE001
         logger.exception("create_run failed")
         raise HTTPException(500, str(exc)) from exc
 
 
-def _universe_names() -> dict[str, str]:
+def _universe_names(market: str = "us") -> dict[str, str]:
     try:
-        return {row["ticker"].upper(): row.get("name") or "" for row in load_universe()}
+        return {
+            row["ticker"].upper(): row.get("name") or ""
+            for row in load_universe(market=market)
+        }
     except Exception:  # noqa: BLE001
         return {}
 
 
+def _parse_market_param(market: str | None) -> str:
+    try:
+        return parse_market(market or "us")
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
 @app.get("/api/runs")
-async def runs(session: AsyncSession = Depends(get_session)) -> list[dict[str, Any]]:
-    rows = await store.list_runs(session)
-    names = _universe_names()
+async def runs(
+    market: str = "us",
+    session: AsyncSession = Depends(get_session),
+) -> list[dict[str, Any]]:
+    mid = _parse_market_param(market)
+    rows = await store.list_runs(session, market=mid)
+    names = _universe_names(mid)
     return [
         {
             "id": r.id,
             "ticker": r.ticker,
+            "market": getattr(r, "market", None) or mid,
             "name": names.get(r.ticker.upper(), ""),
             "status": r.status,
             "nodes": r.nodes,
@@ -153,10 +175,12 @@ async def run_detail(
     row = await store.get_run(session, run_id)
     if not row:
         raise HTTPException(404, "run not found")
-    names = _universe_names()
+    mid = getattr(row, "market", None) or "us"
+    names = _universe_names(mid)
     return {
         "id": row.id,
         "ticker": row.ticker,
+        "market": mid,
         "name": names.get(row.ticker.upper(), ""),
         "status": row.status,
         "nodes": row.nodes,
@@ -169,14 +193,17 @@ async def run_detail(
 
 @app.get("/api/proposals")
 async def proposals(
+    market: str = "us",
     session: AsyncSession = Depends(get_session),
 ) -> list[dict[str, Any]]:
-    rows = await store.list_open_proposals(session)
+    mid = _parse_market_param(market)
+    rows = await store.list_open_proposals(session, market=mid)
     return [
         {
             "id": r.id,
             "run_id": r.run_id,
             "ticker": r.ticker,
+            "market": getattr(r, "market", None) or mid,
             "status": r.status,
             "content_hash": r.content_hash,
             "expires_at": r.expires_at,
@@ -198,13 +225,13 @@ async def proposal_detail(
         "id": row.id,
         "run_id": row.run_id,
         "ticker": row.ticker,
+        "market": getattr(row, "market", None) or "us",
         "status": row.status,
         "content_hash": row.content_hash,
         "expires_at": row.expires_at,
         "payload": row.payload,
         "created_at": row.created_at,
     }
-
 
 @app.post("/api/runs/{run_id}/decision")
 async def decide(
@@ -224,9 +251,10 @@ async def decide(
 
 
 @app.get("/api/book")
-async def book() -> dict[str, Any]:
+async def book(market: str = "us") -> dict[str, Any]:
+    mid = _parse_market_param(market)
     try:
-        snap = get_book_snapshot()
+        snap = get_book_snapshot(mid)
         return snap.model_dump(mode="json")
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(503, f"book unavailable: {exc}") from exc
@@ -243,14 +271,19 @@ async def fills_reconcile(session: AsyncSession = Depends(get_session)) -> dict[
 
 
 @app.get("/api/fills")
-async def fills(session: AsyncSession = Depends(get_session)) -> list[dict[str, Any]]:
-    rows = await store.list_fills(session)
+async def fills(
+    market: str = "us",
+    session: AsyncSession = Depends(get_session),
+) -> list[dict[str, Any]]:
+    mid = _parse_market_param(market)
+    rows = await store.list_fills(session, market=mid)
     return [
         {
             "id": r.id,
             "intent_id": r.intent_id,
             "broker_order_id": r.broker_order_id,
             "ticker": r.ticker,
+            "market": getattr(r, "market", None) or mid,
             "side": r.side,
             "quantity": r.quantity,
             "fill_price": r.fill_price,
@@ -259,7 +292,6 @@ async def fills(session: AsyncSession = Depends(get_session)) -> list[dict[str, 
         }
         for r in rows
     ]
-
 
 def _candidate_out(row: Any) -> dict[str, Any]:
     if isinstance(row, dict):
@@ -285,8 +317,8 @@ def _candidate_out(row: Any) -> dict[str, Any]:
     }
 
 
-async def _hold_tickers(session: AsyncSession) -> set[str]:
-    rows = await store.list_runs(session, limit=40)
+async def _hold_tickers(session: AsyncSession, market: str = "us") -> set[str]:
+    rows = await store.list_runs(session, limit=40, market=market)
     found: set[str] = set()
     for row in rows:
         thesis = (row.state_snapshot or {}).get("pm_thesis") or {}
@@ -296,21 +328,27 @@ async def _hold_tickers(session: AsyncSession) -> set[str]:
 
 
 @app.post("/api/scans")
-async def create_scan(session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
+async def create_scan(
+    body: ScanRequest | None = None,
+    market: str = Query(default="us"),
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    mid = _parse_market_param((body.market if body else None) or market)
     try:
-        universe = load_universe()
+        universe = load_universe(market=mid)
     except (FileNotFoundError, ValueError) as exc:
         raise HTTPException(400, str(exc)) from exc
     held: set[str] = set()
     try:
-        book = get_book_snapshot()
+        book = get_book_snapshot(mid)
         held = {p.ticker.upper() for p in book.positions if p.quantity > 0}
     except Exception as exc:  # noqa: BLE001
         logger.warning("scan continuing without book: %s", exc)
-    holds = await _hold_tickers(session)
+    holds = await _hold_tickers(session, mid)
     try:
         result = await asyncio.to_thread(
             run_scan,
+            market=mid,
             universe=universe,
             held_tickers=held,
             hold_tickers=holds,
@@ -322,11 +360,13 @@ async def create_scan(session: AsyncSession = Depends(get_session)) -> dict[str,
         session,
         regime=result["regime"],
         universe_count=result["universe_count"],
-        payload={"hot_sectors": result.get("hot_sectors") or []},
+        payload={"hot_sectors": result.get("hot_sectors") or [], "market": mid},
         candidates=result["candidates"],
+        market=mid,
     )
     return {
         "id": scan.id,
+        "market": mid,
         "regime": scan.regime,
         "universe_count": scan.universe_count,
         "hot_sectors": result.get("hot_sectors") or [],
@@ -336,13 +376,18 @@ async def create_scan(session: AsyncSession = Depends(get_session)) -> dict[str,
 
 
 @app.get("/api/scans/latest")
-async def latest_scan(session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
-    found = await store.latest_scan(session)
+async def latest_scan(
+    market: str = "us",
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    mid = _parse_market_param(market)
+    found = await store.latest_scan(session, market=mid)
     if not found:
-        return {"id": None, "candidates": []}
+        return {"id": None, "market": mid, "candidates": []}
     scan, rows = found
     return {
         "id": scan.id,
+        "market": getattr(scan, "market", None) or mid,
         "regime": scan.regime,
         "universe_count": scan.universe_count,
         "hot_sectors": (scan.payload or {}).get("hot_sectors") or [],
@@ -352,13 +397,17 @@ async def latest_scan(session: AsyncSession = Depends(get_session)) -> dict[str,
 
 
 @app.get("/api/position-plans")
-async def position_plans(session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
-    plans = await store.list_open_plans(session)
+async def position_plans(
+    market: str = "us",
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    mid = _parse_market_param(market)
+    plans = await store.list_open_plans(session, market=mid)
     planned = {row.ticker.upper() for row in plans}
     unplanned: list[dict[str, Any]] = []
     book_error = None
     try:
-        book = get_book_snapshot()
+        book = get_book_snapshot(mid)
         unplanned = [
             {
                 "ticker": pos.ticker,
@@ -374,21 +423,30 @@ async def position_plans(session: AsyncSession = Depends(get_session)) -> dict[s
         "plans": [plan_to_dict(row) for row in plans],
         "unplanned": unplanned,
         "book_error": book_error,
+        "market": mid,
     }
 
 
 @app.post("/api/exits/review")
-async def exits_review(session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
+async def exits_review(
+    market: str = "us",
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    mid = _parse_market_param(market)
     try:
-        return await review_exits(session, scheduled=False)
+        return await review_exits(session, scheduled=False, market=mid)
     except Exception as exc:  # noqa: BLE001
         logger.exception("exit review failed")
         raise HTTPException(500, str(exc)) from exc
 
 
 @app.get("/api/audit")
-async def audit(session: AsyncSession = Depends(get_session)) -> list[dict[str, Any]]:
-    rows = await store.list_audit(session)
+async def audit(
+    market: str | None = None,
+    session: AsyncSession = Depends(get_session),
+) -> list[dict[str, Any]]:
+    mid = _parse_market_param(market) if market else None
+    rows = await store.list_audit(session, market=mid)
     return [
         {
             "id": r.id,

@@ -137,6 +137,7 @@ class TradeProposal(BaseModel):
     proposal_id: str = Field(default_factory=lambda: str(uuid4()))
     run_id: str
     ticker: str
+    market: Literal["us", "hk"] = "us"
     side: Side
     quantity: float
     size_pct_nav: float
@@ -155,6 +156,7 @@ class TradeProposal(BaseModel):
     def compute_hash(self) -> str:
         payload = {
             "ticker": self.ticker,
+            "market": self.market,
             "side": self.side.value,
             "quantity": self.quantity,
             "size_pct_nav": self.size_pct_nav,
@@ -178,6 +180,7 @@ class ExecutionIntent(BaseModel):
     approval_id: str
     content_hash: str
     ticker: str
+    market: Literal["us", "hk"] = "us"
     side: Side
     quantity: float
     order_type: OrderType
@@ -216,6 +219,8 @@ class PositionView(BaseModel):
     quantity: float
     avg_cost: float | None = None
     market_value: float | None = None
+    currency: str | None = None
+    exchange: str | None = None
 
 
 class BookSnapshot(BaseModel):
@@ -226,6 +231,8 @@ class BookSnapshot(BaseModel):
     open_orders: list[dict[str, Any]] = Field(default_factory=list)
     as_of: datetime = Field(default_factory=utcnow)
     source: Literal["ibkr", "mock"] = "mock"
+    market: Literal["us", "hk"] = "us"
+    currency: str = "USD"
 
 
 class FillRecord(BaseModel):
@@ -233,6 +240,7 @@ class FillRecord(BaseModel):
     intent_id: str
     broker_order_id: str
     ticker: str
+    market: Literal["us", "hk"] = "us"
     side: Side
     quantity: float
     fill_price: float

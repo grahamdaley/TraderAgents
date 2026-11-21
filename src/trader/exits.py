@@ -12,6 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from trader import store
 from trader.config import get_settings
 from trader.db import get_session_factory
+from trader.markets import MARKETS, MarketId, parse_market, tickers_match
 from trader.schemas import utcnow
 from trader.services import get_book_snapshot, start_research_run
 from trader.tools.market_data import get_market_data_tools
@@ -83,9 +84,9 @@ def next_review_at(now: datetime, hour_utc: int) -> datetime:
     return slot
 
 
-def _position_qty(book, ticker: str) -> float:
+def _position_qty(book, ticker: str, market: MarketId | str = "us") -> float:
     for pos in book.positions:
-        if pos.ticker.upper() == ticker.upper():
+        if tickers_match(pos.ticker, ticker, market):
             return float(pos.quantity)
     return 0.0
 
@@ -121,27 +122,29 @@ async def review_exits(
     now: datetime | None = None,
     scheduled: bool = False,
     include_horizon: bool = True,
+    market: MarketId | str = "us",
 ) -> dict[str, Any]:
-    """Evaluate open plans.
+    """Evaluate open plans for one market desk.
 
-    The scheduled pass writes an audit row and will not run twice on the same UTC date.
-    A manual pass still runs. Open Inbox proposals, in-flight runs, and resting /
-    submitted SELLs (IBKR open orders or desk intents awaiting fill) block duplicates.
+    The scheduled pass writes an audit row and will not run twice on the same UTC date
+    for that market. A manual pass still runs. Open Inbox proposals, in-flight runs,
+    and resting / submitted SELLs block duplicates.
     Set include_horizon False to record an elapsed horizon without starting research.
     """
+    mid = parse_market(str(market))
     async with _review_lock:
         moment = now or utcnow()
         if moment.tzinfo is None:
             moment = moment.replace(tzinfo=UTC)
         day = moment.date().isoformat()
-        if scheduled and await store.exit_review_done(session, day):
-            return {"skipped": True, "date": day, "actions": []}
+        if scheduled and await store.exit_review_done(session, f"{mid}:{day}"):
+            return {"skipped": True, "date": day, "market": mid, "actions": []}
 
         settings = get_settings()
-        plans = await store.list_open_plans(session)
-        open_rows = await store.list_open_proposals(session)
+        plans = await store.list_open_plans(session, market=mid)
+        open_rows = await store.list_open_proposals(session, market=mid)
         blocked = {row.ticker.upper() for row in open_rows}
-        runs = await store.list_runs(session, limit=100)
+        runs = await store.list_runs(session, limit=100, market=mid)
         for run in runs:
             if run.status in {"running", "awaiting_human", "processing_decision"}:
                 blocked.add(run.ticker.upper())
@@ -150,6 +153,8 @@ async def review_exits(
         pending_sells: set[str] = set()
         for intent in await store.list_submitted_intents_without_fills(session):
             payload = intent.payload or {}
+            if (payload.get("market") or "us") != mid:
+                continue
             if str(payload.get("side") or "").upper() != "SELL":
                 continue
             ticker = str(payload.get("ticker") or "").upper()
@@ -157,10 +162,16 @@ async def review_exits(
                 pending_sells.add(ticker)
 
         try:
-            book = get_book_snapshot()
+            book = get_book_snapshot(mid)
         except Exception as exc:
             logger.exception("exit review skipped; book unavailable")
-            return {"skipped": True, "date": day, "actions": [], "error": str(exc)}
+            return {
+                "skipped": True,
+                "date": day,
+                "market": mid,
+                "actions": [],
+                "error": str(exc),
+            }
 
         pending_sells |= working_sell_tickers(book)
 
@@ -169,18 +180,20 @@ async def review_exits(
         horizon_started = 0
         for plan in plans:
             ticker = plan.ticker.upper()
-            book_qty = _position_qty(book, ticker)
+            book_qty = _position_qty(book, ticker, mid)
             if book_qty <= 0:
                 plan.status = "closed"
                 plan.closed_at = moment
                 plan.quantity = 0
-                actions.append({"ticker": ticker, "action": "closed_flat"})
+                actions.append({"ticker": ticker, "market": mid, "action": "closed_flat"})
                 continue
             if ticker in blocked:
-                actions.append({"ticker": ticker, "action": "skipped_busy"})
+                actions.append({"ticker": ticker, "market": mid, "action": "skipped_busy"})
                 continue
             if ticker in pending_sells:
-                actions.append({"ticker": ticker, "action": "skipped_working_sell"})
+                actions.append(
+                    {"ticker": ticker, "market": mid, "action": "skipped_working_sell"}
+                )
                 continue
 
             indicators: dict[str, Any] = {}
@@ -198,12 +211,14 @@ async def review_exits(
                     started = await start_research_run(
                         session,
                         ticker,
+                        market=mid,
                         run_kind="exit_rule",
                         exit_reason=reason,
                     )
                     actions.append(
                         {
                             "ticker": ticker,
+                            "market": mid,
                             "action": "exit_proposal",
                             "trigger": "data_error",
                             "run_id": started.get("run_id"),
@@ -214,7 +229,12 @@ async def review_exits(
                 except Exception as exc:
                     logger.exception("exit proposal failed for %s", ticker)
                     actions.append(
-                        {"ticker": ticker, "action": "error", "error": str(exc)}
+                        {
+                            "ticker": ticker,
+                            "market": mid,
+                            "action": "error",
+                            "error": str(exc),
+                        }
                     )
                 continue
             last_close = indicators.get("last_close")
@@ -238,12 +258,14 @@ async def review_exits(
                     started = await start_research_run(
                         session,
                         ticker,
+                        market=mid,
                         run_kind="exit_rule",
                         exit_reason=reason,
                     )
                     actions.append(
                         {
                             "ticker": ticker,
+                            "market": mid,
                             "action": "exit_proposal",
                             "trigger": trigger,
                             "run_id": started.get("run_id"),
@@ -253,11 +275,20 @@ async def review_exits(
                     blocked.add(ticker)
                 except Exception as exc:
                     logger.exception("exit proposal failed for %s", ticker)
-                    actions.append({"ticker": ticker, "action": "error", "error": str(exc)})
+                    actions.append(
+                        {
+                            "ticker": ticker,
+                            "market": mid,
+                            "action": "error",
+                            "error": str(exc),
+                        }
+                    )
                 continue
 
             if trigger == "horizon" and not include_horizon:
-                actions.append({"ticker": ticker, "action": "horizon_skipped"})
+                actions.append(
+                    {"ticker": ticker, "market": mid, "action": "horizon_skipped"}
+                )
                 continue
 
             if trigger == "horizon" and horizon_started < settings.horizon_review_cap:
@@ -274,6 +305,7 @@ async def review_exits(
                     started = await start_research_run(
                         session,
                         ticker,
+                        market=mid,
                         run_kind="horizon_review",
                         position_context=context,
                     )
@@ -281,6 +313,7 @@ async def review_exits(
                     actions.append(
                         {
                             "ticker": ticker,
+                            "market": mid,
                             "action": "horizon_review",
                             "run_id": started.get("run_id"),
                             "status": started.get("status"),
@@ -289,24 +322,40 @@ async def review_exits(
                     blocked.add(ticker)
                 except Exception as exc:
                     logger.exception("horizon review failed for %s", ticker)
-                    actions.append({"ticker": ticker, "action": "error", "error": str(exc)})
+                    actions.append(
+                        {
+                            "ticker": ticker,
+                            "market": mid,
+                            "action": "error",
+                            "error": str(exc),
+                        }
+                    )
             elif trigger == "horizon":
-                actions.append({"ticker": ticker, "action": "horizon_deferred"})
+                actions.append(
+                    {"ticker": ticker, "market": mid, "action": "horizon_deferred"}
+                )
             else:
-                actions.append({"ticker": ticker, "action": "hold", "nearest_rule": nearest})
+                actions.append(
+                    {
+                        "ticker": ticker,
+                        "market": mid,
+                        "action": "hold",
+                        "nearest_rule": nearest,
+                    }
+                )
 
         await session.commit()
         event_type = "exit_review_completed" if scheduled else "exit_review_manual"
         await store.add_audit(
             session,
             event_type=event_type,
-            payload={"date": day, "actions": actions},
+            payload={"date": f"{mid}:{day}" if scheduled else day, "market": mid, "actions": actions},
         )
-        return {"skipped": False, "date": day, "actions": actions}
+        return {"skipped": False, "date": day, "market": mid, "actions": actions}
 
 
 async def exit_review_loop() -> None:
-    """Weekday pass after the configured UTC hour. A restart the same day does not repeat it."""
+    """Weekday pass after the configured UTC hour for each market desk."""
     while True:
         try:
             settings = get_settings()
@@ -315,7 +364,8 @@ async def exit_review_loop() -> None:
             if review_window_open(now, hour):
                 factory = get_session_factory()
                 async with factory() as session:
-                    await review_exits(session, now=now, scheduled=True)
+                    for mid in MARKETS:
+                        await review_exits(session, now=now, scheduled=True, market=mid)
                 delay = max(
                     60.0,
                     (next_review_at(datetime.now(UTC), hour) - datetime.now(UTC)).total_seconds(),

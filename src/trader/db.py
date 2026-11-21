@@ -3,12 +3,21 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import DateTime, Float, Integer, String, Text, func
+from sqlalchemy import DateTime, Float, Integer, String, Text, func, text
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 from trader.config import get_settings
+
+_MARKET_TABLES = (
+    "runs",
+    "proposals",
+    "fills",
+    "position_plans",
+    "scans",
+    "scan_candidates",
+)
 
 
 class Base(DeclarativeBase):
@@ -20,6 +29,7 @@ class RunRow(Base):
 
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
     ticker: Mapped[str] = mapped_column(String(32), index=True)
+    market: Mapped[str] = mapped_column(String(8), index=True, default="us", server_default="us")
     status: Mapped[str] = mapped_column(String(32), index=True)
     thread_id: Mapped[str] = mapped_column(String(64), index=True)
     nodes: Mapped[dict[str, Any]] = mapped_column(JSONB, default=dict)
@@ -39,6 +49,7 @@ class ProposalRow(Base):
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
     run_id: Mapped[str] = mapped_column(String(64), index=True)
     ticker: Mapped[str] = mapped_column(String(32), index=True)
+    market: Mapped[str] = mapped_column(String(8), index=True, default="us", server_default="us")
     status: Mapped[str] = mapped_column(String(32), index=True)
     content_hash: Mapped[str] = mapped_column(String(128))
     payload: Mapped[dict[str, Any]] = mapped_column(JSONB, default=dict)
@@ -71,6 +82,7 @@ class FillRow(Base):
     intent_id: Mapped[str] = mapped_column(String(64), index=True)
     broker_order_id: Mapped[str] = mapped_column(String(64))
     ticker: Mapped[str] = mapped_column(String(32))
+    market: Mapped[str] = mapped_column(String(8), index=True, default="us", server_default="us")
     side: Mapped[str] = mapped_column(String(8))
     quantity: Mapped[float] = mapped_column(Float)
     fill_price: Mapped[float] = mapped_column(Float)
@@ -85,6 +97,7 @@ class ScanRow(Base):
     __tablename__ = "scans"
 
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    market: Mapped[str] = mapped_column(String(8), index=True, default="us", server_default="us")
     regime: Mapped[str] = mapped_column(String(16))
     universe_count: Mapped[int] = mapped_column(Integer)
     payload: Mapped[dict[str, Any]] = mapped_column(JSONB, default=dict)
@@ -99,6 +112,7 @@ class ScanCandidateRow(Base):
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
     scan_id: Mapped[str] = mapped_column(String(64), index=True)
     ticker: Mapped[str] = mapped_column(String(32), index=True)
+    market: Mapped[str] = mapped_column(String(8), index=True, default="us", server_default="us")
     rank: Mapped[int] = mapped_column(Integer)
     score: Mapped[float] = mapped_column(Float)
     sector: Mapped[str] = mapped_column(String(16), default="")
@@ -113,6 +127,7 @@ class PositionPlanRow(Base):
 
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
     ticker: Mapped[str] = mapped_column(String(32), index=True)
+    market: Mapped[str] = mapped_column(String(8), index=True, default="us", server_default="us")
     run_id: Mapped[str] = mapped_column(String(64), default="")
     quantity: Mapped[float] = mapped_column(Float)
     avg_price: Mapped[float] = mapped_column(Float)
@@ -165,7 +180,24 @@ def get_session_factory() -> async_sessionmaker[AsyncSession]:
     return _session_factory
 
 
+async def _ensure_market_columns(conn) -> None:
+    """Idempotent ALTER for existing volumes — create_all does not add columns."""
+    for table in _MARKET_TABLES:
+        await conn.execute(
+            text(
+                f"ALTER TABLE {table} "
+                "ADD COLUMN IF NOT EXISTS market VARCHAR(8) NOT NULL DEFAULT 'us'"
+            )
+        )
+        await conn.execute(
+            text(
+                f"CREATE INDEX IF NOT EXISTS ix_{table}_market ON {table} (market)"
+            )
+        )
+
+
 async def init_db() -> None:
     engine = get_engine()
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        await _ensure_market_columns(conn)

@@ -6,13 +6,18 @@ Operator guide for the investment-committee research desk: start a run, review a
 
 ## What this system does
 
-1. You enter a US equity ticker.
-2. Four specialist agents research it in parallel (fundamentals, technicals, sentiment, macro).
-3. A portfolio manager synthesizes a thesis; a risk narrative and a **code** policy engine decide whether a trade may be proposed.
-4. The run **pauses** for your decision in the operator console.
-5. If you approve, the system submits to **IBKR paper** (or a mock broker in local smoke tests).
+1. Pick a desk in the console: **US** (`/us`) or **Hong Kong** (`/hk`).
+2. Enter a ticker for that market (e.g. `AAPL` or `0700.HK`).
+3. Four specialist agents research it in parallel (fundamentals, technicals, sentiment, macro).
+4. A portfolio manager synthesizes a thesis; a risk narrative and a **code** policy engine decide whether a trade may be proposed (cash and lots are market-scoped: USD whole shares vs HKD board lots).
+5. The run **pauses** for your decision in the operator console.
+6. If you approve, the system submits to **IBKR paper** (SMART/USD or SEHK/HKD).
 
 Research agents never place orders. Only the post-approval execution path can submit.
+
+**Universes:** US uses `config/universe.csv` (S&P 100). HK uses `config/universe-hk.csv` (HSI + Hang Seng TECH). Refresh with `python -m trader.refresh_universe` or `python -m trader.refresh_universe_hk`.
+
+**Autopilot:** when armed, paper mode runs a pass shortly after each market’s open (New York and Hong Kong). `AUTO_TRADE_*` settings apply to both desks.
 
 ---
 

@@ -8,7 +8,17 @@ from collections.abc import Callable, Coroutine
 from typing import Any, TypeVar
 
 from trader.config import Settings, get_settings
-from trader.market_hours import us_equity_session_open
+from trader.market_hours import equity_session_open
+from trader.markets import (
+    MarketId,
+    display_ticker_from_ibkr,
+    get_market,
+    ibkr_symbol,
+    lot_size_for,
+    parse_market,
+    round_to_lot,
+    yahoo_symbol,
+)
 from trader.policy import revalidate_for_execution
 from trader.schemas import (
     BookSnapshot,
@@ -320,7 +330,8 @@ class IBKRAdapter:
                     self._reconnect_on_loop(retries=3)
             return self._run_coro(factory())
 
-    def _mock_book(self) -> BookSnapshot:
+    def _mock_book(self, market: MarketId = "us") -> BookSnapshot:
+        spec = get_market(market)
         positions = [
             PositionView(ticker=t, quantity=q, avg_cost=None, market_value=None)
             for t, q in self._mock_positions.items()
@@ -334,30 +345,42 @@ class IBKRAdapter:
             open_orders=list(self._mock_orders),
             as_of=utcnow(),
             source="mock",
+            market=spec.id,
+            currency=spec.currency,
         )
 
-    def get_book(self) -> BookSnapshot:
+    @staticmethod
+    def _make_stock(ticker: str, market: MarketId | str):
+        from ib_async import Stock
+
+        mid = parse_market(str(market))
+        spec = get_market(mid)
+        return Stock(ibkr_symbol(ticker, mid), spec.ib_exchange, spec.currency)
+
+    def get_book(self, market: MarketId | str = "us") -> BookSnapshot:
+        mid = parse_market(str(market))
         self.assert_trading_mode_safe()
         if self._intentional_mock:
-            return self._mock_book()
-        return self._with_ib(self._get_book_async)
+            return self._mock_book(mid)
+        return self._with_ib(lambda: self._get_book_async(mid))
 
-    async def _get_book_async(self) -> BookSnapshot:
+    async def _get_book_async(self, market: MarketId = "us") -> BookSnapshot:
         ib = self._ib
         assert ib is not None
         account = self.settings.ibkr_account_id
+        spec = get_market(market)
+        target_ccy = spec.currency
         # Run on the IB loop so we touch IB state from the owning thread.
         pos_rows = await ib.reqPositionsAsync()
 
-        # Account base currency may be HKD (or other). IBKR then emits
-        # TotalCashValue/BuyingPower/NetLiquidation in BASE, not USD. Per-currency
-        # cash for US equity trading lives on $LEDGER-* tags.
+        # Account base currency may differ from the desk currency. Prefer
+        # TotalCashValue / ledger rows tagged with the desk currency.
         cash = 0.0
         buying_power = None
-        ledger_usd = None
-        total_cash_usd = None
+        ledger_ccy = None
+        total_cash_ccy = None
         total_cash_base = None
-        buying_power_usd = None
+        buying_power_ccy = None
         buying_power_base = None
         for av in ib.accountValues(account):
             tag = av.tag or ""
@@ -367,36 +390,35 @@ class IBKRAdapter:
             except (TypeError, ValueError):
                 continue
             if tag in {"$LEDGER-CashBalance", "$LEDGER-TotalCashBalance", "CashBalance"}:
-                if currency == "USD":
-                    ledger_usd = value
+                if currency == target_ccy:
+                    ledger_ccy = value
             elif tag == "TotalCashValue":
-                if currency == "USD":
-                    total_cash_usd = value
-                elif currency in {"BASE", "HKD"}:
-                    # Remember base only as last-resort display; prefer USD ledger.
+                if currency == target_ccy:
+                    total_cash_ccy = value
+                elif currency == "BASE" or (market == "us" and currency == "HKD"):
                     if total_cash_base is None or currency == "BASE":
                         total_cash_base = value
             elif tag == "BuyingPower":
-                if currency == "USD":
-                    buying_power_usd = value
+                if currency == target_ccy:
+                    buying_power_ccy = value
                 elif buying_power_base is None:
                     buying_power_base = value
 
-        # Cash used for US equity policy/execution must be USD, not BASE/HKD NAV.
-        if total_cash_usd is not None:
-            cash = total_cash_usd
-        elif ledger_usd is not None:
-            cash = ledger_usd
+        if total_cash_ccy is not None:
+            cash = total_cash_ccy
+        elif ledger_ccy is not None:
+            cash = ledger_ccy
         else:
             cash = 0.0
             logger.warning(
-                "No USD cash row from IBKR (TotalCashValue/ledger); "
+                "No %s cash row from IBKR (TotalCashValue/ledger); "
                 "base TotalCashValue=%s buying_power_base=%s",
+                target_ccy,
                 total_cash_base,
                 buying_power_base,
             )
 
-        buying_power = buying_power_usd if buying_power_usd is not None else None
+        buying_power = buying_power_ccy if buying_power_ccy is not None else None
 
         positions: list[PositionView] = []
         for pos in pos_rows:
@@ -408,12 +430,36 @@ class IBKRAdapter:
                 continue
             if float(pos.position) == 0:
                 continue
+            pos_ccy = (getattr(pos.contract, "currency", None) or "").upper()
+            exchange = (
+                getattr(pos.contract, "primaryExchange", None)
+                or getattr(pos.contract, "exchange", None)
+                or ""
+            )
+            exchange_u = str(exchange).upper()
+            if market == "us":
+                if pos_ccy and pos_ccy not in {"USD", ""}:
+                    continue
+                if exchange_u in {"SEHK", "HKFE"}:
+                    continue
+            else:
+                if pos_ccy and pos_ccy not in {"HKD", ""}:
+                    continue
+                if pos_ccy != "HKD" and exchange_u and exchange_u not in {"SEHK", "HKEX"}:
+                    # Without currency, keep only SEHK-looking contracts.
+                    if not str(pos.contract.symbol or "").isdigit():
+                        continue
+            display = display_ticker_from_ibkr(
+                str(pos.contract.symbol or ""), market, pos_ccy or None
+            )
             positions.append(
                 PositionView(
-                    ticker=pos.contract.symbol,
+                    ticker=display,
                     quantity=float(pos.position),
                     avg_cost=float(pos.avgCost) if pos.avgCost else None,
                     market_value=None,
+                    currency=pos_ccy or target_ccy,
+                    exchange=exchange_u or spec.ib_exchange,
                 )
             )
 
@@ -424,6 +470,11 @@ class IBKRAdapter:
 
         open_orders = []
         for trade in ib.openTrades():
+            order_ccy = (getattr(trade.contract, "currency", None) or "").upper()
+            if market == "us" and order_ccy and order_ccy not in {"USD", ""}:
+                continue
+            if market == "hk" and order_ccy and order_ccy not in {"HKD", ""}:
+                continue
             order_type = str(trade.order.orderType or "")
             limit_price = None
             if order_type == "LMT" and trade.order.lmtPrice is not None:
@@ -431,7 +482,9 @@ class IBKRAdapter:
             open_orders.append(
                 {
                     "order_id": trade.order.orderId,
-                    "ticker": trade.contract.symbol,
+                    "ticker": display_ticker_from_ibkr(
+                        str(trade.contract.symbol or ""), market, order_ccy or None
+                    ),
                     "side": trade.order.action,
                     "quantity": float(trade.order.totalQuantity),
                     "order_type": order_type,
@@ -452,23 +505,33 @@ class IBKRAdapter:
             open_orders=open_orders,
             as_of=utcnow(),
             source="ibkr",
+            market=spec.id,
+            currency=target_ccy,
         )
 
-    def get_quote(self, ticker: str, *, allow_stale: bool = False) -> float:
+    def get_quote(
+        self,
+        ticker: str,
+        *,
+        market: MarketId | str = "us",
+        allow_stale: bool = False,
+    ) -> float:
+        mid = parse_market(str(market))
+        yahoo = yahoo_symbol(ticker, mid)
         self.assert_trading_mode_safe()
         if self._intentional_mock:
-            return self._yahoo_last_close(ticker)
+            return self._yahoo_last_close(yahoo)
 
         try:
-            return self._with_ib(lambda: self._get_quote_async(ticker))
+            return self._with_ib(lambda: self._get_quote_async(yahoo, mid))
         except BrokerError:
             # Paper accounts often lack live API MD (error 10089). Prefer delayed
             # IBKR above; if that still fails, Yahoo keeps research/execution unblocked.
             logger.warning(
                 "IBKR quote unavailable for %s; falling back to Yahoo last close",
-                ticker,
+                yahoo,
             )
-            return self._yahoo_last_close(ticker)
+            return self._yahoo_last_close(yahoo)
 
     @staticmethod
     def _yahoo_last_close(ticker: str) -> float:
@@ -479,7 +542,6 @@ class IBKRAdapter:
         if not last:
             raise BrokerError(f"No fallback quote for {ticker}")
         return float(last)
-
     @staticmethod
     def _price_from_ticker(t: Any) -> float | None:
         for candidate in (t.marketPrice(), t.last, t.close, getattr(t, "bid", None), getattr(t, "ask", None)):
@@ -487,12 +549,10 @@ class IBKRAdapter:
                 return float(candidate)
         return None
 
-    async def _get_quote_async(self, ticker: str) -> float:
-        from ib_async import Stock
-
+    async def _get_quote_async(self, ticker: str, market: MarketId = "us") -> float:
         ib = self._ib
         assert ib is not None
-        contract = Stock(ticker.upper(), "SMART", "USD")
+        contract = self._make_stock(ticker, market)
         await ib.qualifyContractsAsync(contract)
 
         # 1=live, 3=delayed, 4=delayed-frozen. Live API MD often needs a paid
@@ -526,11 +586,14 @@ class IBKRAdapter:
         content_hash: str,
     ) -> SubmitResult:
         with self._lock:
+            mid = parse_market(getattr(proposal, "market", None) or "us")
             self.assert_trading_mode_safe()
-            book = self.get_book()
-            session_open = us_equity_session_open()
+            book = self.get_book(mid)
+            session_open = equity_session_open(mid)
             # Off-hours: IB often has no live print; use Yahoo last close / allow stale.
-            live_price = self.get_quote(proposal.ticker, allow_stale=not session_open)
+            live_price = self.get_quote(
+                proposal.ticker, market=mid, allow_stale=not session_open
+            )
             revalidate_for_execution(
                 proposal=proposal,
                 content_hash=content_hash,
@@ -564,19 +627,28 @@ class IBKRAdapter:
         *,
         session_open: bool,
     ) -> SubmitResult:
-        from ib_async import LimitOrder, MarketOrder, Stock
+        from ib_async import LimitOrder, MarketOrder
 
         ib = self._ib
         assert ib is not None
-        contract = Stock(proposal.ticker.upper(), "SMART", "USD")
+        mid = parse_market(getattr(proposal, "market", None) or "us")
+        spec = get_market(mid)
+        contract = self._make_stock(proposal.ticker, mid)
         await ib.qualifyContractsAsync(contract)
         action = "BUY" if proposal.side == Side.BUY else "SELL"
-        # IBKR API rejects fractional US equity sizes (error 10243).
-        share_qty = int(math.floor(float(proposal.quantity)))
+        lot = lot_size_for(proposal.ticker, mid)
+        # Prefer IBKR minSize when the contract exposes it.
+        min_size = getattr(contract, "minSize", None)
+        try:
+            if min_size is not None and float(min_size) > 0:
+                lot = max(int(float(min_size)), 1)
+        except (TypeError, ValueError):
+            pass
+        share_qty = int(round_to_lot(float(proposal.quantity), lot))
         if share_qty < 1:
             raise BrokerError(
-                f"Quantity {proposal.quantity} rounds to zero whole shares; "
-                "IBKR API cannot place fractional stock orders"
+                f"Quantity {proposal.quantity} rounds to zero lot shares "
+                f"(lot={lot}); cannot place order"
             )
         is_limit = proposal.order_type.value == "LIMIT" and proposal.limit_price
         if is_limit:
@@ -587,7 +659,7 @@ class IBKRAdapter:
         else:
             if not session_open:
                 raise BrokerError(
-                    "Market orders cannot be held outside US regular hours; "
+                    f"Market orders cannot be held outside {spec.label} regular hours; "
                     "use a limit order or approve after the open"
                 )
             order = MarketOrder(action, share_qty)
@@ -627,6 +699,7 @@ class IBKRAdapter:
                 intent_id=intent.intent_id,
                 broker_order_id=order_id,
                 ticker=proposal.ticker.upper(),
+                market=mid,
                 side=proposal.side,
                 quantity=filled_qty,
                 fill_price=fill_price,
@@ -641,7 +714,9 @@ class IBKRAdapter:
 
         resting = {"Submitted", "PreSubmitted", "PendingSubmit", "PendingCancel"}
         if is_limit and status in resting:
-            when = "next US regular session" if not session_open else "the market"
+            when = (
+                f"next {spec.label} regular session" if not session_open else "the market"
+            )
             return SubmitResult(
                 status="submitted",
                 broker_order_id=order_id,
@@ -859,6 +934,7 @@ class IBKRAdapter:
             intent_id=intent.intent_id,
             broker_order_id=order_id,
             ticker=proposal.ticker.upper(),
+            market=parse_market(getattr(proposal, "market", None) or "us"),
             side=proposal.side,
             quantity=proposal.quantity,
             fill_price=live_price,

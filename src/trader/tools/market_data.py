@@ -194,8 +194,17 @@ class MarketDataTools:
             ).model_dump(mode="json"),
         }
 
-    def get_macro_snapshot(self) -> dict[str, Any]:
-        symbols = {"^VIX": "vix", "^GSPC": "spx", "^TNX": "tnx"}
+    def get_macro_snapshot(self, market: str = "us") -> dict[str, Any]:
+        from trader.markets import get_market, parse_market
+
+        mid = parse_market(str(market))
+        spec = get_market(mid)
+        if mid == "us":
+            symbols = {"^VIX": "vix", "^GSPC": "spx", "^TNX": "tnx"}
+            index_symbol = "^GSPC"
+        else:
+            symbols = {spec.regime_vol_symbol: "vix", spec.regime_index_symbol: "spx"}
+            index_symbol = spec.regime_index_symbol
         values: dict[str, float | None] = {}
         for symbol, key in symbols.items():
             try:
@@ -206,19 +215,20 @@ class MarketDataTools:
             except Exception as exc:  # noqa: BLE001
                 logger.warning("macro fetch failed for %s: %s", symbol, exc)
                 values[key] = None
-        spx_hist = yf.Ticker("^GSPC").history(period="3mo")
-        spx_1m = None
-        if not spx_hist.empty and len(spx_hist) >= 21:
-            closes = spx_hist["Close"]
-            spx_1m = _safe_float(closes.iloc[-1] / closes.iloc[-21] - 1)
+        index_hist = yf.Ticker(index_symbol).history(period="3mo")
+        index_1m = None
+        if not index_hist.empty and len(index_hist) >= 21:
+            closes = index_hist["Close"]
+            index_1m = _safe_float(closes.iloc[-1] / closes.iloc[-21] - 1)
         return {
             "vix": values.get("vix"),
             "spx": values.get("spx"),
-            "tnx": values.get("tnx"),
-            "spx_1m_return": spx_1m,
+            "tnx": values.get("tnx") if mid == "us" else None,
+            "spx_1m_return": index_1m,
+            "market": mid,
             "citation": Citation(
-                source_id="yf-macro",
-                label="Yahoo Finance macro snapshot",
+                source_id=f"yf-macro-{mid}",
+                label=f"Yahoo Finance macro snapshot ({mid})",
                 as_of=datetime.now(timezone.utc),
             ).model_dump(mode="json"),
         }

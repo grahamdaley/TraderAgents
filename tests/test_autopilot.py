@@ -137,7 +137,7 @@ async def test_pass_approves_medium_and_skips_low(monkeypatch):
     approved: list[str] = []
     reviews: list[dict] = []
 
-    async def recorded(session, day):
+    async def recorded(session, day, **kwargs):
         return False
 
     async def add_audit(session, **kwargs):
@@ -147,7 +147,7 @@ async def test_pass_approves_medium_and_skips_low(monkeypatch):
         reviews.append(kwargs)
         return {"actions": []}
 
-    async def list_runs(session, limit=50):
+    async def list_runs(session, limit=50, **kwargs):
         return [
             SimpleNamespace(
                 id="run-EXIT",
@@ -171,16 +171,16 @@ async def test_pass_approves_medium_and_skips_low(monkeypatch):
         return []
 
     @asynccontextmanager
-    async def db_lock(day):
+    async def db_lock(day, **kwargs):
         yield True
 
-    async def list_open_proposals(session):
+    async def list_open_proposals(session, **kwargs):
         return []
 
     async def save_scan(session, **kwargs):
         return SimpleNamespace(id="scan-1")
 
-    def load_universe():
+    def load_universe(market="us", **kwargs):
         return [{"ticker": "AAA", "sector": "XLK", "name": "A"}]
 
     def run_scan(**kwargs):
@@ -218,7 +218,7 @@ async def test_pass_approves_medium_and_skips_low(monkeypatch):
     monkeypatch.setattr("trader.autopilot.review_exits", review_exits)
     monkeypatch.setattr("trader.autopilot.load_universe", load_universe)
     monkeypatch.setattr("trader.autopilot.run_scan", run_scan)
-    monkeypatch.setattr("trader.autopilot.get_book_snapshot", lambda: _Book())
+    monkeypatch.setattr("trader.autopilot.get_book_snapshot", lambda market="us": _Book())
     monkeypatch.setattr("trader.store.list_runs", list_runs)
     monkeypatch.setattr("trader.store.list_open_proposals", list_open_proposals)
     monkeypatch.setattr("trader.store.save_scan", save_scan)
@@ -247,14 +247,14 @@ async def test_pass_approves_medium_and_skips_low(monkeypatch):
 async def test_lock_busy_does_not_claim_the_day(monkeypatch):
     audits: list[dict] = []
 
-    async def recorded(session, day):
+    async def recorded(session, day, **kwargs):
         return False
 
     async def add_audit(session, **kwargs):
         audits.append(kwargs)
 
     @asynccontextmanager
-    async def db_lock(day):
+    async def db_lock(day, **kwargs):
         yield False
 
     monkeypatch.setattr("trader.store.autopilot_recorded", recorded)
@@ -271,10 +271,21 @@ async def test_lock_busy_does_not_claim_the_day(monkeypatch):
     assert audits == []
 
 
+def test_hk_autopilot_window_uses_hong_kong_open():
+    _HK = ZoneInfo("Asia/Hong_Kong")
+    early = datetime(2026, 11, 16, 9, 34, tzinfo=_HK)
+    assert autopilot_window_open(early, 5, market="hk") is False
+    opened = datetime(2026, 11, 16, 9, 35, tzinfo=_HK)
+    assert autopilot_window_open(opened, 5, market="hk") is True
+    slot = next_autopilot_at(early, 5, market="hk")
+    assert (slot.hour, slot.minute) == (9, 35)
+    assert slot.tzinfo == _HK
+
+
 async def test_live_mode_skips_without_research(monkeypatch):
     audits: list[dict] = []
 
-    async def recorded(session, day):
+    async def recorded(session, day, **kwargs):
         return False
 
     async def add_audit(session, **kwargs):

@@ -1,25 +1,14 @@
 import React, { useCallback, useEffect, useState } from "react";
 import { createPortal } from "react-dom";
+import { Link, Navigate, Route, Routes, useParams } from "react-router-dom";
+import { MarketProvider, useMarket, withMarketQuery } from "./market.jsx";
 
 const TABS = ["Runs", "Scan", "Inbox", "Book", "Audit"];
 
-const SECTOR_LABELS = {
-  XLK: "Information Technology",
-  XLY: "Consumer Discretionary",
-  XLP: "Consumer Staples",
-  XLV: "Health Care",
-  XLF: "Financials",
-  XLE: "Energy",
-  XLI: "Industrials",
-  XLB: "Materials",
-  XLRE: "Real Estate",
-  XLU: "Utilities",
-  XLC: "Communication Services",
-};
-
-function sectorLabel(code) {
+function sectorLabel(code, labels) {
   if (!code) return "";
-  return SECTOR_LABELS[String(code).toUpperCase()] || "";
+  const map = labels || {};
+  return map[String(code).toUpperCase()] || String(code);
 }
 
 async function api(path, options = {}) {
@@ -108,17 +97,23 @@ function explain(error) {
 }
 
 function RunsPanel({ onSelectRun }) {
-  const [ticker, setTicker] = useState("AAPL");
+  const market = useMarket();
+  const [ticker, setTicker] = useState(market.defaultTicker);
   const [runs, setRuns] = useState([]);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [selected, setSelected] = useState(null);
 
+  useEffect(() => {
+    setTicker(market.defaultTicker);
+    setSelected(null);
+  }, [market.id, market.defaultTicker]);
+
   const refresh = useCallback(async () => {
-    const data = await api("/api/runs");
+    const data = await api(withMarketQuery("/api/runs", market.id));
     setRuns(data);
     setError("");
-  }, []);
+  }, [market.id]);
 
   useEffect(() => {
     refresh().catch((e) => setError(explain(e)));
@@ -134,7 +129,7 @@ function RunsPanel({ onSelectRun }) {
     try {
       const result = await api("/api/runs", {
         method: "POST",
-        body: JSON.stringify({ ticker }),
+        body: JSON.stringify({ ticker, market: market.id }),
       });
       await refresh();
       const detail = await api(`/api/runs/${result.run_id}`);
@@ -252,14 +247,15 @@ function RunsPanel({ onSelectRun }) {
 }
 
 function ScanPanel({ onStarted }) {
+  const market = useMarket();
   const [scan, setScan] = useState(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [starting, setStarting] = useState("");
 
   const refresh = useCallback(async () => {
-    setScan(await api("/api/scans/latest"));
-  }, []);
+    setScan(await api(withMarketQuery("/api/scans/latest", market.id)));
+  }, [market.id]);
 
   useEffect(() => {
     refresh().catch((e) => setError(String(e.message || e)));
@@ -269,7 +265,12 @@ function ScanPanel({ onStarted }) {
     setBusy(true);
     setError("");
     try {
-      setScan(await api("/api/scans", { method: "POST" }));
+      setScan(
+        await api("/api/scans", {
+          method: "POST",
+          body: JSON.stringify({ market: market.id }),
+        })
+      );
     } catch (e) {
       setError(String(e.message || e));
     } finally {
@@ -283,7 +284,7 @@ function ScanPanel({ onStarted }) {
     try {
       await api("/api/runs", {
         method: "POST",
-        body: JSON.stringify({ ticker }),
+        body: JSON.stringify({ ticker, market: market.id }),
       });
       onStarted?.();
     } catch (e) {
@@ -334,7 +335,9 @@ function ScanPanel({ onStarted }) {
                 <Hint hint={row.name}>{row.ticker}</Hint>
               </td>
               <td className="muted">
-                <Hint hint={sectorLabel(row.sector)}>{row.sector}</Hint>
+                <Hint hint={sectorLabel(row.sector, market.sectorLabels)}>
+                  {row.sector}
+                </Hint>
               </td>
               <td>{row.score}</td>
               <td className="muted">{(row.signals || []).join(", ")}</td>
@@ -364,6 +367,7 @@ function ScanPanel({ onStarted }) {
 }
 
 function InboxPanel() {
+  const market = useMarket();
   const [items, setItems] = useState([]);
   const [selected, setSelected] = useState(null);
   const [qty, setQty] = useState("");
@@ -373,9 +377,9 @@ function InboxPanel() {
   const [busy, setBusy] = useState(false);
 
   const refresh = useCallback(async () => {
-    const data = await api("/api/proposals");
+    const data = await api(withMarketQuery("/api/proposals", market.id));
     setItems(data);
-  }, []);
+  }, [market.id]);
 
   useEffect(() => {
     refresh().catch((e) => setError(String(e.message || e)));
@@ -422,7 +426,7 @@ function InboxPanel() {
       } else if (status === "submitted") {
         setNotice(
           note ||
-            "Limit order submitted to IBKR and will work when the US market is open."
+            `Limit order submitted to IBKR and will work when the ${market.sessionName} is open.`
         );
       } else if (status === "filled") {
         setNotice("Order filled.");
@@ -539,6 +543,7 @@ function InboxPanel() {
 }
 
 function BookPanel() {
+  const market = useMarket();
   const [book, setBook] = useState(null);
   const [fills, setFills] = useState([]);
   const [plans, setPlans] = useState({ plans: [], unplanned: [] });
@@ -550,14 +555,14 @@ function BookPanel() {
 
   const refresh = useCallback(async () => {
     const [b, f, p] = await Promise.all([
-      api("/api/book"),
-      api("/api/fills"),
-      api("/api/position-plans"),
+      api(withMarketQuery("/api/book", market.id)),
+      api(withMarketQuery("/api/fills", market.id)),
+      api(withMarketQuery("/api/position-plans", market.id)),
     ]);
     setBook(b);
     setFills(f);
     setPlans(p);
-  }, []);
+  }, [market.id]);
 
   useEffect(() => {
     refresh().catch((e) => setError(String(e.message || e)));
@@ -570,7 +575,10 @@ function BookPanel() {
     setReviewNote("");
     setError("");
     try {
-      const result = await api("/api/exits/review", { method: "POST" });
+      const result = await api(
+        withMarketQuery("/api/exits/review", market.id),
+        { method: "POST" }
+      );
       const count = (result.actions || []).length;
       setReviewNote(
         result.skipped
@@ -679,7 +687,8 @@ function BookPanel() {
         </div>
         {error ? <div className="error">{error}</div> : null}
         <p>
-          Cash <strong>{book ? book.cash.toFixed(2) : "—"}</strong>
+          Cash ({market.currency}){" "}
+          <strong>{book ? book.cash.toFixed(2) : "—"}</strong>
           {book?.buying_power != null ? (
             <>
               {" "}
@@ -715,7 +724,8 @@ function BookPanel() {
 
         <h4 style={{ margin: "20px 0 8px" }}>Open orders</h4>
         <p className="muted" style={{ margin: "0 0 8px" }}>
-          Live working orders at IBKR (limits rest until filled or DAY expires at the US close).
+          Live working orders at IBKR (limits rest until filled or DAY expires at the{" "}
+          {market.closeName}).
         </p>
         <table className="table">
           <thead>
@@ -813,12 +823,13 @@ function BookPanel() {
 }
 
 function AuditPanel() {
+  const market = useMarket();
   const [events, setEvents] = useState([]);
   const [error, setError] = useState("");
 
   const refresh = useCallback(async () => {
-    setEvents(await api("/api/audit"));
-  }, []);
+    setEvents(await api(withMarketQuery("/api/audit", market.id)));
+  }, [market.id]);
 
   useEffect(() => {
     refresh().catch((e) => setError(String(e.message || e)));
@@ -865,9 +876,14 @@ function AuditPanel() {
   );
 }
 
-export default function App() {
+function DeskApp({ marketId }) {
   const [tab, setTab] = useState("Runs");
   const [health, setHealth] = useState(null);
+  const market = useMarket();
+
+  useEffect(() => {
+    setTab("Runs");
+  }, [marketId]);
 
   useEffect(() => {
     api("/api/health")
@@ -880,7 +896,9 @@ export default function App() {
       <header>
         <div>
           <h1>Research Desk</h1>
-          <p>Human-confirmed IBKR paper trading</p>
+          <p>
+            Human-confirmed IBKR paper trading · {market.label} ({market.currency})
+          </p>
         </div>
         <div className="muted" style={{ textAlign: "right" }}>
           {health?.trading_mode ? (
@@ -895,6 +913,23 @@ export default function App() {
           )}
         </div>
       </header>
+
+      <div className="tabs" style={{ marginBottom: 8 }}>
+        <Link
+          className={`tab ${marketId === "us" ? "active" : ""}`}
+          to="/us"
+          style={{ textDecoration: "none" }}
+        >
+          US
+        </Link>
+        <Link
+          className={`tab ${marketId === "hk" ? "active" : ""}`}
+          to="/hk"
+          style={{ textDecoration: "none" }}
+        >
+          Hong Kong
+        </Link>
+      </div>
 
       <div className="tabs">
         {TABS.map((name) => (
@@ -914,5 +949,26 @@ export default function App() {
       {tab === "Book" ? <BookPanel /> : null}
       {tab === "Audit" ? <AuditPanel /> : null}
     </div>
+  );
+}
+
+function MarketRoute() {
+  const { marketId } = useParams();
+  if (marketId !== "us" && marketId !== "hk") {
+    return <Navigate to="/us" replace />;
+  }
+  return (
+    <MarketProvider market={marketId}>
+      <DeskApp marketId={marketId} />
+    </MarketProvider>
+  );
+}
+
+export default function App() {
+  return (
+    <Routes>
+      <Route path="/" element={<Navigate to="/us" replace />} />
+      <Route path="/:marketId/*" element={<MarketRoute />} />
+    </Routes>
   );
 }
