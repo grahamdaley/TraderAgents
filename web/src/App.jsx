@@ -883,11 +883,12 @@ export default function App() {
           <p>Human-confirmed IBKR paper trading</p>
         </div>
         <div className="muted" style={{ textAlign: "right" }}>
-          {health ? (
+          {health?.trading_mode ? (
             <>
               mode <strong>{health.trading_mode}</strong>
               {health.mock_broker ? " · mock broker" : " · IBKR connected"}
               {health.mock_llm ? " · mock LLM" : " · Nous"}
+              {health.autopilot_armed ? " · Autopilot armed" : " · Autopilot off"}
             </>
           ) : (
             "connecting…"

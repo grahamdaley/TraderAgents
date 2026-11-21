@@ -120,12 +120,14 @@ async def review_exits(
     *,
     now: datetime | None = None,
     scheduled: bool = False,
+    include_horizon: bool = True,
 ) -> dict[str, Any]:
     """Evaluate open plans.
 
     The scheduled pass writes an audit row and will not run twice on the same UTC date.
     A manual pass still runs. Open Inbox proposals, in-flight runs, and resting /
     submitted SELLs (IBKR open orders or desk intents awaiting fill) block duplicates.
+    Set include_horizon False to record an elapsed horizon without starting research.
     """
     async with _review_lock:
         moment = now or utcnow()
@@ -252,6 +254,10 @@ async def review_exits(
                 except Exception as exc:
                     logger.exception("exit proposal failed for %s", ticker)
                     actions.append({"ticker": ticker, "action": "error", "error": str(exc)})
+                continue
+
+            if trigger == "horizon" and not include_horizon:
+                actions.append({"ticker": ticker, "action": "horizon_skipped"})
                 continue
 
             if trigger == "horizon" and horizon_started < settings.horizon_review_cap:

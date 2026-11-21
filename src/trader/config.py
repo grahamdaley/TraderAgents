@@ -65,6 +65,16 @@ class Settings(BaseSettings):
     starting_cash: float = Field(default=100_000.0, alias="STARTING_CASH")
     restricted_tickers: str = Field(default="", alias="RESTRICTED_TICKERS")
 
+    auto_trade_enabled: bool = Field(default=False, alias="AUTO_TRADE_ENABLED")
+    auto_trade_minutes_after_open: int = Field(
+        default=5, alias="AUTO_TRADE_MINUTES_AFTER_OPEN"
+    )
+    auto_research_top_n: int = Field(default=3, alias="AUTO_RESEARCH_TOP_N")
+    auto_max_new_buys: int = Field(default=3, alias="AUTO_MAX_NEW_BUYS")
+    auto_min_conviction: Literal["LOW", "MEDIUM", "HIGH"] = Field(
+        default="MEDIUM", alias="AUTO_MIN_CONVICTION"
+    )
+
     operator_user: str = Field(default="operator", alias="OPERATOR_USER")
     operator_password: str = Field(default="change_me", alias="OPERATOR_PASSWORD")
 
@@ -74,7 +84,7 @@ class Settings(BaseSettings):
     allow_mock_llm: bool = Field(default=False, alias="ALLOW_MOCK_LLM")
     allow_mock_broker: bool = Field(default=False, alias="ALLOW_MOCK_BROKER")
 
-    @field_validator("ibkr_live_orders_enabled", mode="before")
+    @field_validator("ibkr_live_orders_enabled", "auto_trade_enabled", mode="before")
     @classmethod
     def _parse_bool(cls, value: object) -> bool:
         if isinstance(value, str):

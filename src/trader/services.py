@@ -22,6 +22,12 @@ from trader.schemas import (
 
 logger = logging.getLogger(__name__)
 
+AUTOPILOT_OPERATOR = "autopilot"
+
+
+def decision_event_type(operator: str) -> str:
+    return "auto_decision" if operator == AUTOPILOT_OPERATOR else "human_decision"
+
 
 def _serialize_state(values: dict[str, Any]) -> dict[str, Any]:
     out: dict[str, Any] = {}
@@ -263,16 +269,56 @@ async def resume_with_decision(
             },
         )
 
-    # Audit the human decision only after resume completed successfully.
+    # Audit the decision only after resume completed successfully.
+    side = None
+    if isinstance(proposal_data, dict):
+        side = proposal_data.get("side")
     await store.add_audit(
         session,
-        event_type="human_decision",
+        event_type=decision_event_type(request.operator),
         actor=request.operator,
         run_id=run_id,
-        payload={**decision, "final_status": status},
+        payload={**decision, "final_status": status, "side": side},
     )
 
     return {"run_id": run_id, "status": status, "state": values}
+
+
+async def maybe_auto_approve(
+    session: AsyncSession,
+    *,
+    run_id: str,
+    state: dict[str, Any],
+    buys_used: int,
+    settings: Any | None = None,
+) -> dict[str, Any]:
+    """Resume an awaiting run when paper autopilot is armed and the proposal clears the floor.
+
+    Exit sells do not consume the daily buy cap. A skip leaves the proposal in the Inbox.
+    """
+    from trader.autopilot import approval_skip_reason
+    from trader.config import get_settings
+
+    settings = settings or get_settings()
+    reason = approval_skip_reason(state=state, buys_used=buys_used, settings=settings)
+    if reason:
+        return {"approved": False, "reason": reason, "buys_used": buys_used}
+
+    proposal = (state or {}).get("trade_proposal") or {}
+    side = str(proposal.get("side") or "").upper()
+    request = ApprovalRequest(
+        action="approve",
+        operator=AUTOPILOT_OPERATOR,
+        note="paper autopilot",
+    )
+    result = await resume_with_decision(session, run_id=run_id, request=request)
+    new_buys = buys_used + (1 if side == "BUY" else 0)
+    return {
+        "approved": True,
+        "reason": "approved",
+        "buys_used": new_buys,
+        "status": result.get("status"),
+    }
 
 
 def get_book_snapshot():

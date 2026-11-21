@@ -198,6 +198,24 @@ IDs must match [Nous Portal models](https://portal.nousresearch.com/models) (pro
 
 Live trading requires **both** `IBKR_TRADING_MODE=live` and `IBKR_LIVE_ORDERS_ENABLED=true`. Do not enable that until you intentionally move to phase 3.
 
+### Paper autopilot
+
+US cash hours are 22:30–05:00 Hong Kong time, and a proposal expires 30 minutes after it is created. With autopilot armed, the desk runs one pass each New York weekday shortly after the open (default 09:35 America/New_York) so those steps do not wait overnight.
+
+The pass flattens loss and trend breaks, scans, researches up to `AUTO_RESEARCH_TOP_N` names (one per sector), and approves a limit proposal immediately when PM conviction is at least `AUTO_MIN_CONVICTION`. New buys that pass stop at `AUTO_MAX_NEW_BUYS`. `LOW` conviction, `HOLD`, and anything policy rejects stay unapproved. Horizon re-research is not started on this pass; use the manual exit review button for that.
+
+The header shows **Autopilot armed** or **Autopilot off**. Audit rows use actor `autopilot` and event type `auto_decision`. A finished pass is not repeated the same New York day. If the process stops before that finished audit, the next start can run the rest of the pass, and names already researched or bought that day are skipped so orders are not duplicated. A live-mode skip is recorded but does not block the day: after you switch back to paper and restart, the same session can still run. Exit sells already waiting in the Inbox are approved on that pass when they have not expired. If the API was down at the slot, the pass runs on the next start that same weekday.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `AUTO_TRADE_ENABLED` | `false` | Master switch. Off leaves Scan and Inbox manual |
+| `AUTO_TRADE_MINUTES_AFTER_OPEN` | `5` | Minutes after 09:30 America/New_York |
+| `AUTO_RESEARCH_TOP_N` | `3` | Names researched from the scan |
+| `AUTO_MAX_NEW_BUYS` | `3` | Buy orders the pass may approve. Exit sells do not count |
+| `AUTO_MIN_CONVICTION` | `MEDIUM` | Lowest PM conviction that is auto-approved |
+
+The switch is armed only when `AUTO_TRADE_ENABLED=true`, `IBKR_TRADING_MODE=paper`, and `IBKR_LIVE_ORDERS_ENABLED=false`. Live mode ignores the flag and writes an `autopilot_skipped` audit row. Policy checks still run before a proposal exists and again at submit.
+
 ---
 
 ## API cheat sheet
@@ -248,7 +266,7 @@ For edits, include `"quantity"` and/or `"limit_price"`.
 
 - Never put secrets in prompts, logs, or the audit payload (account id and order ids are logged; passwords are not).
 - Keep live orders disabled until you deliberately enable both live flags.
-- Prefer limit orders and human review for every proposal in phase 1.
+- Prefer limit orders. Human review stays on for every proposal until paper autopilot is armed.
 - Mock broker is off by default; only enable it for offline development.
 
 ---

@@ -15,6 +15,7 @@ from trader import store
 from trader.broker import get_broker
 from trader.config import get_settings
 from trader.db import get_session_factory, init_db
+from trader.autopilot import autopilot_armed, autopilot_loop
 from trader.exits import exit_review_loop, review_exits
 from trader.fills import fill_reconcile_loop, reconcile_submitted_fills
 from trader.nous import NousCatalogError, verify_configured_models
@@ -62,8 +63,9 @@ async def lifespan(app: FastAPI):
         logger.warning("Graph init warning: %s", exc)
     review_task = asyncio.create_task(exit_review_loop())
     fill_task = asyncio.create_task(fill_reconcile_loop())
+    autopilot_task = asyncio.create_task(autopilot_loop())
     yield
-    for task in (review_task, fill_task):
+    for task in (review_task, fill_task, autopilot_task):
         task.cancel()
         try:
             await task
@@ -94,6 +96,8 @@ async def health() -> dict[str, Any]:
         "live_orders_enabled": settings.ibkr_live_orders_enabled,
         "mock_llm": settings.allow_mock_llm or not bool(settings.nous_api_key),
         "mock_broker": get_broker().using_mock,
+        "autopilot_enabled": settings.auto_trade_enabled,
+        "autopilot_armed": autopilot_armed(settings),
     }
 
 

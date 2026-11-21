@@ -419,6 +419,39 @@ async def exit_review_done(session: AsyncSession, day: str) -> bool:
     return False
 
 
+async def autopilot_recorded(session: AsyncSession, day: str) -> bool:
+    """True only after a pass for this New York day has finished.
+
+    A started row, a live-mode skip, or a crash before the finished audit
+    does not block another attempt.
+    """
+    from trader.autopilot import pass_already_finished
+
+    result = await session.execute(
+        select(AuditRow)
+        .where(AuditRow.event_type == "autopilot_completed")
+        .order_by(AuditRow.created_at.desc())
+        .limit(40)
+    )
+    for row in result.scalars():
+        payload = row.payload or {}
+        if payload.get("date") == day and pass_already_finished(payload):
+            return True
+    return False
+
+
+async def list_events(
+    session: AsyncSession, event_type: str, limit: int = 100
+) -> list[AuditRow]:
+    result = await session.execute(
+        select(AuditRow)
+        .where(AuditRow.event_type == event_type)
+        .order_by(AuditRow.created_at.desc())
+        .limit(limit)
+    )
+    return list(result.scalars())
+
+
 async def list_audit(session: AsyncSession, limit: int = 200) -> list[AuditRow]:
     result = await session.execute(
         select(AuditRow).order_by(AuditRow.created_at.desc()).limit(limit)
