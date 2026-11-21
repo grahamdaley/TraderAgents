@@ -11,6 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from trader import store
 from trader.broker import get_broker
 from trader.db import IntentRow, get_session_factory
+from trader.markets import normalize_ticker, parse_market
 from trader.positions import record_fill_on_plan
 from trader.schemas import FillRecord, RunStatus, Side, utcnow
 
@@ -55,9 +56,20 @@ async def _apply_fill(
         side = Side(side_raw)
     except ValueError:
         side = Side.BUY
-    ticker = str(
-        payload.get("ticker") or outcome.get("ticker") or ""
-    ).upper()
+    run = await store.get_run(session, intent.run_id)
+    market = parse_market(
+        str(
+            payload.get("market")
+            or (run.market if run else None)
+            or "us"
+        )
+    )
+    # Prefer intent/Yahoo ticker over IBKR symbol so plans stay on 0700.HK not 700.
+    raw_ticker = str(payload.get("ticker") or outcome.get("ticker") or "").upper()
+    try:
+        ticker = normalize_ticker(raw_ticker, market)
+    except ValueError:
+        ticker = raw_ticker
     filled_qty = float(outcome.get("filled_qty") or 0)
     avg_price = float(outcome.get("avg_price") or 0)
     broker_order_id = str(
@@ -71,6 +83,7 @@ async def _apply_fill(
         intent_id=intent.id,
         broker_order_id=broker_order_id,
         ticker=ticker,
+        market=market,
         side=side,
         quantity=filled_qty,
         fill_price=avg_price,
@@ -82,9 +95,9 @@ async def _apply_fill(
         session, intent.id, "filled", broker_order_id=broker_order_id
     )
 
-    run = await store.get_run(session, intent.run_id)
     snapshot = dict(run.state_snapshot or {}) if run else {}
     snapshot["fill"] = fill.model_dump(mode="json")
+    snapshot["market"] = market
     snapshot["status"] = RunStatus.FILLED.value
     snapshot.setdefault("execution_intent", payload)
     await store.update_run(
@@ -109,6 +122,7 @@ async def _apply_fill(
         payload={
             "broker_order_id": fill.broker_order_id,
             "ticker": fill.ticker,
+            "market": market,
             "quantity": fill.quantity,
             "fill_price": fill.fill_price,
             "account_id": fill.account_id,

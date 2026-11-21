@@ -358,7 +358,9 @@ def test_exit_path_reaches_the_inbox(monkeypatch):
             return 100.0
 
     monkeypatch.setattr("trader.graph.get_broker", lambda: FakeBroker())
-    monkeypatch.setattr("trader.graph.list_open_proposal_tickers_sync", lambda: set())
+    monkeypatch.setattr(
+        "trader.graph.list_open_proposal_tickers_sync", lambda market="us": set()
+    )
     graph = build_graph()
     state = initial_state("run-exit", "AAPL", run_kind="exit_rule", exit_reason="below SMA50")
     _result, snapshot, _interrupt = invoke_graph_locked(

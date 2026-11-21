@@ -132,6 +132,7 @@ async def start_research_run(
             payload={
                 "proposal_id": proposal.proposal_id,
                 "ticker": proposal.ticker,
+                "market": getattr(proposal, "market", None) or market,
                 "side": proposal.side.value,
                 "quantity": proposal.quantity,
                 "content_hash": proposal.content_hash,
@@ -146,6 +147,7 @@ async def start_research_run(
                 ticker.upper(),
                 int(thesis.get("horizon_days") or 30),
                 str(thesis.get("thesis") or ""),
+                market=market,
             )
 
     return {
@@ -239,6 +241,9 @@ async def resume_with_decision(
             payload={
                 "broker_order_id": fill_rec.broker_order_id,
                 "ticker": fill_rec.ticker,
+                "market": getattr(fill_rec, "market", None)
+                or getattr(intent, "market", None)
+                or "us",
                 "quantity": fill_rec.quantity,
                 "fill_price": fill_rec.fill_price,
                 "account_id": fill_rec.account_id,
@@ -266,6 +271,7 @@ async def resume_with_decision(
                 "client_order_id": intent.client_order_id,
                 "broker_status": submit_result.get("broker_status"),
                 "ticker": intent.ticker,
+                "market": getattr(intent, "market", None) or "us",
                 "quantity": intent.quantity,
                 "limit_price": intent.limit_price,
                 "message": submit_result.get("message"),
@@ -274,14 +280,27 @@ async def resume_with_decision(
 
     # Audit the decision only after resume completed successfully.
     side = None
+    market = "us"
     if isinstance(proposal_data, dict):
         side = proposal_data.get("side")
+        market = str(proposal_data.get("market") or "us")
+    else:
+        market = str(
+            (values.get("market") if isinstance(values, dict) else None)
+            or getattr(row, "market", None)
+            or "us"
+        )
     await store.add_audit(
         session,
         event_type=decision_event_type(request.operator),
         actor=request.operator,
         run_id=run_id,
-        payload={**decision, "final_status": status, "side": side},
+        payload={
+            **decision,
+            "final_status": status,
+            "side": side,
+            "market": market,
+        },
     )
 
     return {"run_id": run_id, "status": status, "state": values}

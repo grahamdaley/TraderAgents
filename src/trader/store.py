@@ -98,7 +98,7 @@ async def claim_run_for_decision(session: AsyncSession, run_id: str) -> RunRow |
     return row
 
 
-def list_open_proposal_tickers_sync() -> set[str]:
+def list_open_proposal_tickers_sync(market: str = "us") -> set[str]:
     """Sync lookup for policy_node (runs inside LangGraph worker threads)."""
     settings = get_settings()
     engine = create_engine(settings.database_url_sync)
@@ -107,8 +107,9 @@ def list_open_proposal_tickers_sync() -> set[str]:
             rows = conn.execute(
                 text(
                     "SELECT DISTINCT ticker FROM proposals "
-                    "WHERE status = 'awaiting_human'"
-                )
+                    "WHERE status = 'awaiting_human' AND market = :market"
+                ),
+                {"market": market},
             )
             return {str(r[0]).upper() for r in rows if r[0]}
     except Exception:  # noqa: BLE001

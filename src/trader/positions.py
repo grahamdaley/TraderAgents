@@ -103,8 +103,15 @@ async def record_fill_on_plan(session: AsyncSession, values: dict[str, Any]) -> 
         await session.commit()
 
 
-async def postpone_plan(session: AsyncSession, ticker: str, horizon_days: int, summary: str) -> None:
-    existing = await store.get_open_plan(session, ticker)
+async def postpone_plan(
+    session: AsyncSession,
+    ticker: str,
+    horizon_days: int,
+    summary: str,
+    *,
+    market: str = "us",
+) -> None:
+    existing = await store.get_open_plan(session, ticker, market=market)
     if not existing:
         return
     horizon = clamp_horizon_days(horizon_days)

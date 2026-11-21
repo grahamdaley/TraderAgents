@@ -528,7 +528,7 @@ def policy_node(state: ICState) -> dict[str, Any]:
             reference_price=reference_price,
             model_ids=state.get("model_ids") or {},
             citation_ids=list(dict.fromkeys(state.get("citation_ids") or [])),
-            open_proposal_tickers=list_open_proposal_tickers_sync(),
+            open_proposal_tickers=list_open_proposal_tickers_sync(market),
             market=market,
         )
         nodes = _mark(nodes, "policy", NodeStatus.DONE)

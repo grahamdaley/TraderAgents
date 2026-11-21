@@ -62,9 +62,16 @@ class IBKRAdapter:
         self._lock = threading.Lock()
         self._connect_lock = threading.Lock()
         self._intentional_mock = False
-        self._mock_cash = self.settings.starting_cash
-        self._mock_positions: dict[str, float] = {}
-        self._mock_orders: list[dict[str, Any]] = []
+        starting = self.settings.starting_cash
+        self._mock_cash_by_market: dict[str, float] = {"us": starting, "hk": starting}
+        self._mock_positions_by_market: dict[str, dict[str, float]] = {
+            "us": {},
+            "hk": {},
+        }
+        self._mock_orders_by_market: dict[str, list[dict[str, Any]]] = {
+            "us": [],
+            "hk": [],
+        }
         self._loop: asyncio.AbstractEventLoop | None = None
         self._ib_thread: threading.Thread | None = None
 
@@ -331,18 +338,27 @@ class IBKRAdapter:
             return self._run_coro(factory())
 
     def _mock_book(self, market: MarketId = "us") -> BookSnapshot:
-        spec = get_market(market)
+        mid = parse_market(str(market))
+        spec = get_market(mid)
+        cash = float(self._mock_cash_by_market.get(mid, self.settings.starting_cash))
         positions = [
-            PositionView(ticker=t, quantity=q, avg_cost=None, market_value=None)
-            for t, q in self._mock_positions.items()
+            PositionView(
+                ticker=t,
+                quantity=q,
+                avg_cost=None,
+                market_value=None,
+                currency=spec.currency,
+                exchange=spec.ib_exchange,
+            )
+            for t, q in self._mock_positions_by_market.get(mid, {}).items()
             if q
         ]
         return BookSnapshot(
             account_id=self.settings.ibkr_account_id or "MOCK-DU",
-            cash=self._mock_cash,
-            buying_power=self._mock_cash,
+            cash=cash,
+            buying_power=cash,
             positions=positions,
-            open_orders=list(self._mock_orders),
+            open_orders=list(self._mock_orders_by_market.get(mid, [])),
             as_of=utcnow(),
             source="mock",
             market=spec.id,
@@ -908,20 +924,24 @@ class IBKRAdapter:
     def _mock_fill(
         self, proposal: TradeProposal, intent: ExecutionIntent, live_price: float
     ) -> FillRecord:
+        mid = parse_market(getattr(proposal, "market", None) or "us")
+        cash = self._mock_cash_by_market.setdefault(mid, self.settings.starting_cash)
+        positions = self._mock_positions_by_market.setdefault(mid, {})
+        orders = self._mock_orders_by_market.setdefault(mid, [])
         notional = proposal.quantity * live_price
         if proposal.side == Side.BUY:
-            self._mock_cash -= notional
-            self._mock_positions[proposal.ticker] = (
-                self._mock_positions.get(proposal.ticker, 0.0) + proposal.quantity
+            self._mock_cash_by_market[mid] = cash - notional
+            positions[proposal.ticker] = (
+                positions.get(proposal.ticker, 0.0) + proposal.quantity
             )
         else:
-            self._mock_cash += notional
-            self._mock_positions[proposal.ticker] = max(
+            self._mock_cash_by_market[mid] = cash + notional
+            positions[proposal.ticker] = max(
                 0.0,
-                self._mock_positions.get(proposal.ticker, 0.0) - proposal.quantity,
+                positions.get(proposal.ticker, 0.0) - proposal.quantity,
             )
         order_id = f"MOCK-{intent.client_order_id}"
-        self._mock_orders.append(
+        orders.append(
             {
                 "order_id": order_id,
                 "ticker": proposal.ticker,
@@ -934,7 +954,7 @@ class IBKRAdapter:
             intent_id=intent.intent_id,
             broker_order_id=order_id,
             ticker=proposal.ticker.upper(),
-            market=parse_market(getattr(proposal, "market", None) or "us"),
+            market=mid,
             side=proposal.side,
             quantity=proposal.quantity,
             fill_price=live_price,
