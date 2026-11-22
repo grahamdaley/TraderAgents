@@ -423,7 +423,7 @@ async def _run_locked_pass(
 
         held: set[str] = set()
         try:
-            book = get_book_snapshot(market)
+            book = await asyncio.to_thread(get_book_snapshot, market)
             held = {
                 p.ticker.upper()
                 for p in book.positions

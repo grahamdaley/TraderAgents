@@ -162,7 +162,7 @@ async def review_exits(
                 pending_sells.add(ticker)
 
         try:
-            book = get_book_snapshot(mid)
+            book = await asyncio.to_thread(get_book_snapshot, mid)
         except Exception as exc:
             logger.exception("exit review skipped; book unavailable")
             return {

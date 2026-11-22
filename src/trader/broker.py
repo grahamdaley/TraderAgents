@@ -4,6 +4,7 @@ import asyncio
 import logging
 import math
 import threading
+import time
 from collections.abc import Callable, Coroutine
 from typing import Any, TypeVar
 
@@ -60,7 +61,9 @@ class IBKRAdapter:
         self.settings = settings or get_settings()
         self._ib = None
         self._lock = threading.Lock()
-        self._connect_lock = threading.Lock()
+        # RLock: _start_ib_thread may call disconnect() while connect/ensure_connected
+        # already holds the lock (timeout / connect-error cleanup).
+        self._connect_lock = threading.RLock()
         self._intentional_mock = False
         starting = self.settings.starting_cash
         self._mock_cash_by_market: dict[str, float] = {"us": starting, "hk": starting}
@@ -74,6 +77,11 @@ class IBKRAdapter:
         }
         self._loop: asyncio.AbstractEventLoop | None = None
         self._ib_thread: threading.Thread | None = None
+        # After a failed reconnect, fail fast for a short window so polling
+        # endpoints cannot pile up multi-minute blocking reconnect storms.
+        self._reconnect_cooldown_until: float = 0.0
+        self._reconnect_cooldown_seconds: float = 15.0
+        self._last_reconnect_error: str | None = None
 
     @property
     def using_mock(self) -> bool:
@@ -120,6 +128,10 @@ class IBKRAdapter:
             "timeout",
             "client id is already in use",
             "already in use",
+            "name resolution",
+            "temporary failure in name resolution",
+            "nodename nor servname",
+            "gaierror",
         )
         return any(n in text for n in needles)
 
@@ -136,11 +148,17 @@ class IBKRAdapter:
         with self._connect_lock:
             if self._is_connected():
                 return
-            if self._loop is not None and self._loop.is_running() and self._ib is not None:
-                # Thread still alive — reconnect on the existing loop.
-                self._reconnect_on_loop(retries=3)
-                return
-            self._start_ib_thread()
+            self._raise_if_reconnect_cooling_down()
+            try:
+                if self._loop is not None and self._loop.is_running() and self._ib is not None:
+                    # Thread still alive — reconnect on the existing loop.
+                    self._reconnect_on_loop(retries=3)
+                    return
+                self._start_ib_thread()
+                self._clear_reconnect_failure()
+            except Exception as exc:  # noqa: BLE001
+                self._mark_reconnect_failure(exc)
+                raise
 
     def _start_ib_thread(self) -> None:
         # Ensure any prior half-dead thread is gone before starting another.
@@ -175,7 +193,7 @@ class IBKRAdapter:
             target=runner, name="ibkr-client", daemon=True
         )
         self._ib_thread.start()
-        if not ready.wait(timeout=30):
+        if not ready.wait(timeout=20):
             self.disconnect()
             raise BrokerError("IBKR connect timed out")
         if errors:
@@ -224,6 +242,25 @@ class IBKRAdapter:
             self.settings.ibkr_client_id,
         )
 
+    def _mark_reconnect_failure(self, exc: BaseException | None) -> None:
+        self._last_reconnect_error = str(exc) if exc else "IBKR not connected"
+        self._reconnect_cooldown_until = (
+            time.monotonic() + self._reconnect_cooldown_seconds
+        )
+
+    def _clear_reconnect_failure(self) -> None:
+        self._last_reconnect_error = None
+        self._reconnect_cooldown_until = 0.0
+
+    def _raise_if_reconnect_cooling_down(self) -> None:
+        remaining = self._reconnect_cooldown_until - time.monotonic()
+        if remaining <= 0:
+            return
+        detail = self._last_reconnect_error or "IBKR not connected"
+        raise BrokerError(
+            f"IBKR reconnect cooling down ({remaining:.0f}s): {detail}"
+        )
+
     def _reconnect_on_loop(self, *, retries: int = 3) -> None:
         loop = self._loop
         if loop is None or not loop.is_running():
@@ -234,8 +271,9 @@ class IBKRAdapter:
             try:
                 asyncio.run_coroutine_threadsafe(
                     self._connect_ib_async(), loop
-                ).result(timeout=30)
+                ).result(timeout=15)
                 if self._is_connected():
+                    self._clear_reconnect_failure()
                     return
             except Exception as exc:  # noqa: BLE001
                 last_exc = exc
@@ -245,13 +283,15 @@ class IBKRAdapter:
                     retries,
                     exc,
                 )
-                threading.Event().wait(min(2 * attempt, 6))
+                threading.Event().wait(min(1 * attempt, 3))
         # Loop may be wedged — full thread restart.
         logger.warning("IBKR reconnect via loop failed; restarting IB thread")
         self._shutdown_ib_thread()
         try:
             self._start_ib_thread()
+            self._clear_reconnect_failure()
         except Exception as exc:  # noqa: BLE001
+            self._mark_reconnect_failure(last_exc or exc)
             raise BrokerError(
                 f"IBKR reconnect failed: {last_exc or exc}"
             ) from (last_exc or exc)
@@ -267,12 +307,19 @@ class IBKRAdapter:
                 return
             if self._intentional_mock:
                 return
+            self._raise_if_reconnect_cooling_down()
             logger.warning("IBKR session not connected; reconnecting to Gateway")
-            if self._loop is not None and self._loop.is_running():
-                self._reconnect_on_loop(retries=3)
-            else:
-                self._start_ib_thread()
+            try:
+                if self._loop is not None and self._loop.is_running():
+                    self._reconnect_on_loop(retries=3)
+                else:
+                    self._start_ib_thread()
+                    self._clear_reconnect_failure()
+            except Exception as exc:  # noqa: BLE001
+                self._mark_reconnect_failure(exc)
+                raise
             if not self._is_connected():
+                self._mark_reconnect_failure(None)
                 raise BrokerError("IBKR not connected")
 
     def _shutdown_ib_thread(self) -> None:

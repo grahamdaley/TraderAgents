@@ -1,0 +1,9 @@
+# Hotfix override: mount host src/config over the API image.
+# Usage (Linux box):
+#   docker compose -f docker-compose.yml -f docker-compose.deploy.yml \
+#     -f docker-compose.live-src.yml up -d api
+services:
+  api:
+    volumes:
+      - ./src:/app/src
+      - ./config:/app/config

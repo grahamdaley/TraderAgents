@@ -254,7 +254,8 @@ async def decide(
 async def book(market: str = "us") -> dict[str, Any]:
     mid = _parse_market_param(market)
     try:
-        snap = get_book_snapshot(mid)
+        # Broker I/O is sync; keep it off the uvicorn event loop.
+        snap = await asyncio.to_thread(get_book_snapshot, mid)
         return snap.model_dump(mode="json")
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(503, f"book unavailable: {exc}") from exc
@@ -340,7 +341,7 @@ async def create_scan(
         raise HTTPException(400, str(exc)) from exc
     held: set[str] = set()
     try:
-        book = get_book_snapshot(mid)
+        book = await asyncio.to_thread(get_book_snapshot, mid)
         held = {p.ticker.upper() for p in book.positions if p.quantity > 0}
     except Exception as exc:  # noqa: BLE001
         logger.warning("scan continuing without book: %s", exc)
@@ -407,7 +408,7 @@ async def position_plans(
     unplanned: list[dict[str, Any]] = []
     book_error = None
     try:
-        book = get_book_snapshot(mid)
+        book = await asyncio.to_thread(get_book_snapshot, mid)
         unplanned = [
             {
                 "ticker": pos.ticker,
