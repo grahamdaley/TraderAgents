@@ -67,6 +67,71 @@ def test_hold_rejected():
         )
 
 
+def test_buy_bumps_to_one_board_lot_when_cash_allows():
+    """3% of NAV can round below a 1000-share HK lot; bump if cash covers it."""
+    thesis = PmThesis(
+        ticker="2319.HK",
+        side=Side.BUY,
+        conviction="MEDIUM",
+        size_pct_nav=0.03,
+        thesis="Tactical long",
+    )
+    risk = RiskNarrative(
+        ticker="2319.HK", narrative="ok", recommend_proceed=True
+    )
+    book = BookSnapshot(
+        account_id="DU123",
+        cash=451_643.66,
+        positions=[],
+        market="hk",
+        currency="HKD",
+    )
+    proposal = build_trade_proposal(
+        run_id="r1",
+        thesis=thesis,
+        risk=risk,
+        book=book,
+        reference_price=22.04,
+        model_ids={"pm": "mock"},
+        citation_ids=["c1"],
+        market="hk",
+    )
+    assert proposal.quantity == pytest.approx(1000.0)
+    assert proposal.size_pct_nav == pytest.approx(1000.0 * 22.04 / 451_643.66)
+    assert any(c.name == "board_lot_bump" and c.passed for c in proposal.policy_checks)
+
+
+def test_buy_rejects_when_one_board_lot_unaffordable():
+    thesis = PmThesis(
+        ticker="2319.HK",
+        side=Side.BUY,
+        conviction="MEDIUM",
+        size_pct_nav=0.03,
+        thesis="Tactical long",
+    )
+    risk = RiskNarrative(
+        ticker="2319.HK", narrative="ok", recommend_proceed=True
+    )
+    book = BookSnapshot(
+        account_id="DU123",
+        cash=10_000.0,
+        positions=[],
+        market="hk",
+        currency="HKD",
+    )
+    with pytest.raises(PolicyRejection, match="Insufficient cash"):
+        build_trade_proposal(
+            run_id="r1",
+            thesis=thesis,
+            risk=risk,
+            book=book,
+            reference_price=22.04,
+            model_ids={},
+            citation_ids=[],
+            market="hk",
+        )
+
+
 def test_price_band_blocks_execution():
     proposal = TradeProposal(
         run_id="r1",

@@ -143,14 +143,47 @@ def build_trade_proposal(
     current_qty = _position_qty(book, ticker, mid)
 
     if thesis.side == Side.BUY:
+        # Target % of NAV can round below one board lot (common on HK).
+        # Bump to a single lot when cash covers it rather than rejecting.
+        if quantity <= 0:
+            one_lot_cost = float(lot) * reference_price
+            if one_lot_cost <= book.cash:
+                quantity = float(lot)
+                bumped_pct = (quantity * reference_price) / nav if nav > 0 else size_pct
+                size_pct = min(1.0, bumped_pct)
+                checks.append(
+                    PolicyCheck(
+                        name="board_lot_bump",
+                        passed=True,
+                        detail=(
+                            f"Bumped to 1 board lot ({lot} shares); "
+                            f"target ~{target_notional:.2f} was below lot "
+                            f"(~{one_lot_cost:.2f} {book.currency})"
+                        ),
+                    )
+                )
+            else:
+                checks.append(
+                    PolicyCheck(
+                        name="cash_check",
+                        passed=False,
+                        detail=(
+                            f"One board lot ({lot} shares @ {reference_price:.2f}) "
+                            f"costs ~{one_lot_cost:.2f}, "
+                            f"cash={book.cash:.2f} {book.currency}"
+                        ),
+                    )
+                )
+                raise PolicyRejection("Insufficient cash", checks)
+
         notional = quantity * reference_price
-        if quantity <= 0 or notional > book.cash:
+        if notional > book.cash:
             checks.append(
                 PolicyCheck(
                     name="cash_check",
                     passed=False,
                     detail=(
-                        f"Need ~{target_notional:.2f} ({quantity} shares, lot={lot}), "
+                        f"Need ~{notional:.2f} ({quantity} shares, lot={lot}), "
                         f"cash={book.cash:.2f} {book.currency}"
                     ),
                 )
