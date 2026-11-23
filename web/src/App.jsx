@@ -366,7 +366,7 @@ function ScanPanel({ onStarted }) {
   );
 }
 
-function InboxPanel() {
+function InboxPanel({ onCountChange }) {
   const market = useMarket();
   const [items, setItems] = useState([]);
   const [selected, setSelected] = useState(null);
@@ -379,7 +379,8 @@ function InboxPanel() {
   const refresh = useCallback(async () => {
     const data = await api(withMarketQuery("/api/proposals", market.id));
     setItems(data);
-  }, [market.id]);
+    onCountChange?.(Array.isArray(data) ? data.length : 0);
+  }, [market.id, onCountChange]);
 
   useEffect(() => {
     refresh().catch((e) => setError(String(e.message || e)));
@@ -893,11 +894,24 @@ function AuditPanel() {
 function DeskApp({ marketId }) {
   const [tab, setTab] = useState("Runs");
   const [health, setHealth] = useState(null);
+  const [inboxCount, setInboxCount] = useState(0);
   const market = useMarket();
 
   useEffect(() => {
     setTab("Runs");
+    setInboxCount(0);
   }, [marketId]);
+
+  const refreshInboxCount = useCallback(async () => {
+    const data = await api(withMarketQuery("/api/proposals", market.id));
+    setInboxCount(Array.isArray(data) ? data.length : 0);
+  }, [market.id]);
+
+  useEffect(() => {
+    refreshInboxCount().catch(() => setInboxCount(0));
+    const id = setInterval(() => refreshInboxCount().catch(() => {}), 4000);
+    return () => clearInterval(id);
+  }, [refreshInboxCount]);
 
   useEffect(() => {
     api("/api/health")
@@ -953,13 +967,18 @@ function DeskApp({ marketId }) {
             onClick={() => setTab(name)}
           >
             {name}
+            {name === "Inbox" && inboxCount > 0 ? (
+              <span className="tab-count" aria-label={`${inboxCount} awaiting approval`}>
+                {inboxCount}
+              </span>
+            ) : null}
           </button>
         ))}
       </div>
 
       {tab === "Runs" ? <RunsPanel /> : null}
       {tab === "Scan" ? <ScanPanel onStarted={() => setTab("Runs")} /> : null}
-      {tab === "Inbox" ? <InboxPanel /> : null}
+      {tab === "Inbox" ? <InboxPanel onCountChange={setInboxCount} /> : null}
       {tab === "Book" ? <BookPanel /> : null}
       {tab === "Audit" ? <AuditPanel /> : null}
     </div>

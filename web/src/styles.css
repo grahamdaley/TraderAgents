@@ -61,6 +61,9 @@ header p {
 }
 
 .tab {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
   background: transparent;
   border: 1px solid var(--border);
   color: var(--muted);
@@ -73,6 +76,26 @@ header p {
   background: var(--accent);
   border-color: var(--accent);
   color: white;
+}
+
+.tab-count {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 1.25rem;
+  height: 1.25rem;
+  padding: 0 6px;
+  border-radius: 999px;
+  background: var(--warn);
+  color: #1a1200;
+  font-size: 0.72rem;
+  font-weight: 700;
+  line-height: 1;
+}
+
+.tab.active .tab-count {
+  background: rgba(255, 255, 255, 0.95);
+  color: var(--accent);
 }
 
 .panel {
