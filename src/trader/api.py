@@ -256,7 +256,13 @@ async def book(market: str = "us") -> dict[str, Any]:
     try:
         # Broker I/O is sync; keep it off the uvicorn event loop.
         snap = await asyncio.to_thread(get_book_snapshot, mid)
-        return snap.model_dump(mode="json")
+        data = snap.model_dump(mode="json")
+        names = _universe_names(mid)
+        for pos in data.get("positions") or []:
+            pos["name"] = names.get(str(pos.get("ticker") or "").upper(), "")
+        for order in data.get("open_orders") or []:
+            order["name"] = names.get(str(order.get("ticker") or "").upper(), "")
+        return data
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(503, f"book unavailable: {exc}") from exc
 
@@ -278,6 +284,7 @@ async def fills(
 ) -> list[dict[str, Any]]:
     mid = _parse_market_param(market)
     rows = await store.list_fills(session, market=mid)
+    names = _universe_names(mid)
     return [
         {
             "id": r.id,
@@ -285,6 +292,7 @@ async def fills(
             "broker_order_id": r.broker_order_id,
             "ticker": r.ticker,
             "market": getattr(r, "market", None) or mid,
+            "name": names.get(r.ticker.upper(), ""),
             "side": r.side,
             "quantity": r.quantity,
             "fill_price": r.fill_price,
@@ -405,6 +413,7 @@ async def position_plans(
     mid = _parse_market_param(market)
     plans = await store.list_open_plans(session, market=mid)
     planned = {row.ticker.upper() for row in plans}
+    names = _universe_names(mid)
     unplanned: list[dict[str, Any]] = []
     book_error = None
     try:
@@ -414,14 +423,20 @@ async def position_plans(
                 "ticker": pos.ticker,
                 "quantity": pos.quantity,
                 "avg_cost": pos.avg_cost,
+                "name": names.get(pos.ticker.upper(), ""),
             }
             for pos in book.positions
             if pos.quantity > 0 and pos.ticker.upper() not in planned
         ]
     except Exception as exc:  # noqa: BLE001
         book_error = str(exc)
+    plan_rows = []
+    for row in plans:
+        item = plan_to_dict(row)
+        item["name"] = names.get(row.ticker.upper(), "")
+        plan_rows.append(item)
     return {
-        "plans": [plan_to_dict(row) for row in plans],
+        "plans": plan_rows,
         "unplanned": unplanned,
         "book_error": book_error,
         "market": mid,

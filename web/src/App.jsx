@@ -645,7 +645,9 @@ function BookPanel() {
           <tbody>
             {(plans.plans || []).map((plan) => (
               <tr key={plan.id}>
-                <td>{plan.ticker}</td>
+                <td>
+                  <Hint hint={plan.name}>{plan.ticker}</Hint>
+                </td>
                 <td>{plan.quantity}</td>
                 <td>{plan.avg_price != null ? Number(plan.avg_price).toFixed(2) : "—"}</td>
                 <td className="muted">
@@ -667,8 +669,14 @@ function BookPanel() {
         {(plans.unplanned || []).length ? (
           <p className="muted">
             Unplanned broker positions:{" "}
-            {plans.unplanned.map((p) => `${p.ticker} (${p.quantity})`).join(", ")}. These are not
-            auto-sold.
+            {plans.unplanned.map((p, i) => (
+              <React.Fragment key={p.ticker}>
+                {i > 0 ? ", " : null}
+                <Hint hint={p.name}>{p.ticker}</Hint>
+                {` (${p.quantity})`}
+              </React.Fragment>
+            ))}
+            . These are not auto-sold.
           </p>
         ) : null}
       </div>
@@ -707,7 +715,9 @@ function BookPanel() {
           <tbody>
             {(book?.positions || []).map((p) => (
               <tr key={p.ticker}>
-                <td>{p.ticker}</td>
+                <td>
+                  <Hint hint={p.name}>{p.ticker}</Hint>
+                </td>
                 <td>{p.quantity}</td>
                 <td>{p.avg_cost ?? "—"}</td>
               </tr>
@@ -745,7 +755,9 @@ function BookPanel() {
             {(book?.open_orders || []).map((o) => (
               <tr key={o.order_id}>
                 <td className="muted">{o.order_id}</td>
-                <td>{o.ticker}</td>
+                <td>
+                  <Hint hint={o.name}>{o.ticker}</Hint>
+                </td>
                 <td>{o.side}</td>
                 <td>{o.quantity}</td>
                 <td>{o.order_type || "—"}</td>
@@ -801,7 +813,9 @@ function BookPanel() {
                 <td className="muted">
                   {f.filled_at ? new Date(f.filled_at).toLocaleString() : "—"}
                 </td>
-                <td>{f.ticker}</td>
+                <td>
+                  <Hint hint={f.name}>{f.ticker}</Hint>
+                </td>
                 <td>{f.side}</td>
                 <td>{f.quantity}</td>
                 <td>{f.fill_price}</td>
