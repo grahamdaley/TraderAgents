@@ -591,7 +591,11 @@ def execute_node(state: ICState) -> dict[str, Any]:
             lot = lot_size_for(proposal.ticker, market)
             proposal.quantity = round_to_lot(float(decision["quantity"]), lot)
         if decision.get("limit_price") is not None:
-            proposal.limit_price = round(float(decision["limit_price"]), 2)
+            from trader.markets import round_to_tick
+
+            proposal.limit_price = round_to_tick(
+                float(decision["limit_price"]), market
+            )
         # SELL stays at or under the live long; oversized edits are clamped.
         if proposal.side == Side.SELL:
             from trader.markets import tickers_match

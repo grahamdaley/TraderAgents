@@ -18,6 +18,7 @@ from trader.markets import (
     lot_size_for,
     parse_market,
     round_to_lot,
+    round_to_tick,
     yahoo_symbol,
 )
 from trader.policy import revalidate_for_execution
@@ -82,6 +83,8 @@ class IBKRAdapter:
         self._reconnect_cooldown_until: float = 0.0
         self._reconnect_cooldown_seconds: float = 15.0
         self._last_reconnect_error: str | None = None
+        # Bumped when Gateway still holds the previous clientId after a crash.
+        self._client_id_offset: int = 0
 
     @property
     def using_mock(self) -> bool:
@@ -203,6 +206,12 @@ class IBKRAdapter:
             self.disconnect()
             raise BrokerError("IBKR connect finished without a live session")
 
+    def _next_client_id(self) -> int:
+        base = int(self.settings.ibkr_client_id)
+        # Keep the active id in a small rotating window so a crashed API
+        # process that still holds clientId N can reconnect on N+1..N+4.
+        return base + (self._client_id_offset % 5)
+
     async def _connect_ib_async(self) -> None:
         from ib_async import IB
 
@@ -216,31 +225,56 @@ class IBKRAdapter:
                 pass
             self._ib = None
 
-        ib = IB()
+        last_exc: BaseException | None = None
+        for _ in range(5):
+            ib = IB()
 
-        def _on_disconnected() -> None:
-            logger.warning(
-                "IBKR Gateway disconnected (host=%s port=%s); will reconnect on next use",
+            def _on_disconnected() -> None:
+                logger.warning(
+                    "IBKR Gateway disconnected (host=%s port=%s); will reconnect on next use",
+                    self.settings.ibkr_host,
+                    self.settings.ibkr_port,
+                )
+
+            ib.disconnectedEvent += _on_disconnected
+            client_id = self._next_client_id()
+            try:
+                await ib.connectAsync(
+                    self.settings.ibkr_host,
+                    self.settings.ibkr_port,
+                    clientId=client_id,
+                    readonly=False,
+                    timeout=8,
+                )
+            except Exception as exc:  # noqa: BLE001
+                last_exc = exc
+                try:
+                    ib.disconnect()
+                except Exception:  # noqa: BLE001
+                    pass
+                # Error 326 ("client id already in use") is often only logged by
+                # ib_async while connectAsync raises TimeoutError — always rotate
+                # across the small clientId window before giving up.
+                self._client_id_offset += 1
+                logger.warning(
+                    "IBKR connect failed on clientId %s (%s); trying %s",
+                    client_id,
+                    exc or type(exc).__name__,
+                    self._next_client_id(),
+                )
+                continue
+            self._ib = ib
+            logger.info(
+                "Connected to IBKR Gateway %s:%s mode=%s clientId=%s",
                 self.settings.ibkr_host,
                 self.settings.ibkr_port,
+                self.settings.ibkr_trading_mode,
+                client_id,
             )
-
-        ib.disconnectedEvent += _on_disconnected
-        await ib.connectAsync(
-            self.settings.ibkr_host,
-            self.settings.ibkr_port,
-            clientId=self.settings.ibkr_client_id,
-            readonly=False,
-            timeout=8,
-        )
-        self._ib = ib
-        logger.info(
-            "Connected to IBKR Gateway %s:%s mode=%s clientId=%s",
-            self.settings.ibkr_host,
-            self.settings.ibkr_port,
-            self.settings.ibkr_trading_mode,
-            self.settings.ibkr_client_id,
-        )
+            return
+        raise BrokerError(
+            f"IBKR connect failed after clientId rotation: {last_exc}"
+        ) from last_exc
 
     def _mark_reconnect_failure(self, exc: BaseException | None) -> None:
         self._last_reconnect_error = str(exc) if exc else "IBKR not connected"
@@ -367,6 +401,11 @@ class IBKRAdapter:
             raise BrokerError(
                 f"IBKR request timed out after {timeout:.0f}s"
             ) from exc
+        except Exception as exc:  # noqa: BLE001
+            # Surface disconnects as BrokerError so _with_ib can reconnect.
+            if self._is_disconnect_error(exc):
+                raise BrokerError(str(exc) or "IBKR not connected") from exc
+            raise
 
     def _with_ib(self, factory: Callable[[], Coroutine[Any, Any, T]]) -> T:
         """Run an IB coroutine factory, reconnecting once on disconnect errors."""
@@ -381,6 +420,10 @@ class IBKRAdapter:
             )
             with self._connect_lock:
                 if not self._is_connected():
+                    self._reconnect_on_loop(retries=3)
+                else:
+                    # Session looked up but the call still failed — force a
+                    # fresh socket (covers half-open Gateway after nightly reauth).
                     self._reconnect_on_loop(retries=3)
             return self._run_coro(factory())
 
@@ -633,9 +676,14 @@ class IBKRAdapter:
                     return price
             # Snapshot stream as a second chance for delayed farms.
             ticker_row = ib.reqMktData(contract, "", False, False)
-            await asyncio.sleep(1.25)
-            price = self._price_from_ticker(ticker_row)
-            ib.cancelMktData(contract)
+            try:
+                await asyncio.sleep(1.25)
+                price = self._price_from_ticker(ticker_row)
+            finally:
+                try:
+                    ib.cancelMktData(contract)
+                except Exception:  # noqa: BLE001
+                    pass
             if price is not None:
                 return price
             last_error = f"md_type={md_type} empty"
@@ -715,7 +763,16 @@ class IBKRAdapter:
             )
         is_limit = proposal.order_type.value == "LIMIT" and proposal.limit_price
         if is_limit:
-            limit = round(float(proposal.limit_price), 2)
+            ib_tick: float | None = None
+            try:
+                details = await ib.reqContractDetailsAsync(contract)
+                if details:
+                    raw_tick = getattr(details[0], "minTick", None)
+                    if raw_tick is not None and float(raw_tick) > 0:
+                        ib_tick = float(raw_tick)
+            except Exception:  # noqa: BLE001
+                logger.debug("IBKR minTick lookup failed", exc_info=True)
+            limit = round_to_tick(float(proposal.limit_price), mid, tick=ib_tick)
             order = LimitOrder(action, share_qty, limit)
             # DAY rests for the next regular session when placed off-hours.
             order.tif = "DAY"

@@ -6,6 +6,8 @@ from trader.markets import (
     ibkr_symbol,
     normalize_ticker,
     round_to_lot,
+    round_to_tick,
+    sehk_tick_size,
     tickers_match,
 )
 
@@ -28,6 +30,28 @@ def test_round_to_lot():
     assert round_to_lot(350, 100) == 300.0
     assert round_to_lot(99, 100) == 0.0
     assert round_to_lot(10.9, 1) == 10.0
+
+
+def test_sehk_tick_size_bands():
+    assert sehk_tick_size(0.20) == 0.001
+    assert sehk_tick_size(0.40) == 0.005
+    assert sehk_tick_size(9.99) == 0.01
+    assert sehk_tick_size(15.0) == 0.02
+    assert sehk_tick_size(50.0) == 0.05
+    assert sehk_tick_size(137.14) == 0.10
+    assert sehk_tick_size(250.0) == 0.20
+
+
+def test_round_to_tick_sehk_rejects_error_110_prices():
+    # IBKR Error 110 on 0669.HK used 137.14 / 135.64 — both off the 0.10 tick.
+    assert round_to_tick(137.14, "hk") == 137.10
+    assert round_to_tick(135.64, "hk") == 135.60
+    assert round_to_tick(135.3 * 1.001, "hk") == 135.40
+
+
+def test_round_to_tick_us_pennies():
+    assert round_to_tick(100.104, "us") == 100.10
+    assert round_to_tick(100.105, "us") == 100.11
 
 
 def test_tickers_match_hk_forms():

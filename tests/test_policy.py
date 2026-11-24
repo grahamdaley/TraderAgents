@@ -101,6 +101,40 @@ def test_buy_bumps_to_one_board_lot_when_cash_allows():
     assert any(c.name == "board_lot_bump" and c.passed for c in proposal.policy_checks)
 
 
+def test_hk_limit_price_snaps_to_sehk_tick():
+    """Regression: 0669.HK limits at *.14/*.64 were rejected (IBKR Error 110)."""
+    thesis = PmThesis(
+        ticker="0669.HK",
+        side=Side.BUY,
+        conviction="MEDIUM",
+        size_pct_nav=0.03,
+        thesis="Starter long",
+    )
+    risk = RiskNarrative(
+        ticker="0669.HK", narrative="ok", recommend_proceed=True
+    )
+    book = BookSnapshot(
+        account_id="DU123",
+        cash=500_000.0,
+        positions=[],
+        market="hk",
+        currency="HKD",
+    )
+    proposal = build_trade_proposal(
+        run_id="r1",
+        thesis=thesis,
+        risk=risk,
+        book=book,
+        reference_price=137.0,
+        model_ids={"pm": "mock"},
+        citation_ids=["c1"],
+        market="hk",
+    )
+    # 137.0 * 1.001 = 137.137 → nearest 0.10 tick is 137.10
+    assert proposal.limit_price == pytest.approx(137.10)
+    assert abs(proposal.limit_price * 10 - round(proposal.limit_price * 10)) < 1e-9
+
+
 def test_buy_rejects_when_one_board_lot_unaffordable():
     thesis = PmThesis(
         ticker="2319.HK",

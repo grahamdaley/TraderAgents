@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import math
 import re
 from dataclasses import dataclass
+from decimal import ROUND_HALF_UP, Decimal
 from pathlib import Path
 from typing import Literal
 from zoneinfo import ZoneInfo
@@ -15,6 +17,21 @@ MarketId = Literal["us", "hk"]
 _US_TICKER_RE = re.compile(r"^[A-Z0-9.\-]+$")
 _HK_YAHOO_RE = re.compile(r"^(\d{1,5})\.HK$")
 _HK_NUMERIC_RE = re.compile(r"^\d{1,5}$")
+
+# HKEX Main Board tick table (price → minimum price variation).
+# Boundaries match "from X to Y" / "over X to Y" in the exchange schedule.
+_SEHK_TICK_BANDS: tuple[tuple[float, float], ...] = (
+    (0.25, 0.001),
+    (0.50, 0.005),
+    (10.0, 0.01),
+    (20.0, 0.02),
+    (100.0, 0.05),
+    (200.0, 0.10),
+    (500.0, 0.20),
+    (1000.0, 0.50),
+    (2000.0, 1.0),
+    (5000.0, 2.0),
+)
 
 
 @dataclass(frozen=True)
@@ -53,7 +70,8 @@ MARKETS: dict[MarketId, MarketSpec] = {
         yahoo_suffix=".HK",
         timezone=ZoneInfo("Asia/Hong_Kong"),
         universe_path=CONFIG_DIR / "universe-hk.csv",
-        regime_vol_symbol="^VHSI",
+        # Yahoo no longer serves ^VHSI; scanners derive a VIX-like level from HSI.
+        regime_vol_symbol="",
         regime_index_symbol="^HSI",
         default_ticker="0700.HK",
         default_lot_size=100,
@@ -143,6 +161,49 @@ def round_to_lot(quantity: float, lot_size: int) -> float:
         return 0.0
     lots = int(quantity) // lot
     return float(lots * lot)
+
+
+def sehk_tick_size(price: float) -> float:
+    """HKEX Main Board minimum price variation for ``price``."""
+    p = abs(float(price))
+    if p <= 0:
+        return 0.001
+    for upper, tick in _SEHK_TICK_BANDS:
+        if p <= upper:
+            return tick
+    return 5.0
+
+
+def tick_size_for_price(price: float, market: MarketId | str) -> float:
+    """Venue tick size used when rounding limit prices."""
+    mid = parse_market(str(market))
+    if mid == "hk":
+        return sehk_tick_size(price)
+    # US listed equities ≥ $1 trade in pennies; sub-dollar uses $0.0001.
+    return 0.0001 if abs(float(price)) < 1.0 else 0.01
+
+
+def round_to_tick(
+    price: float,
+    market: MarketId | str,
+    *,
+    tick: float | None = None,
+) -> float:
+    """Round a limit price to a valid venue tick (nearest, half-up).
+
+    ``tick`` overrides the market table — use IBKR ``minTick`` when available.
+    """
+    raw = float(price)
+    if not math.isfinite(raw) or raw <= 0:
+        raise ValueError(f"limit price must be a positive finite number; got {price!r}")
+    size = float(tick) if tick is not None and float(tick) > 0 else tick_size_for_price(
+        raw, market
+    )
+    # Quantize via Decimal so SEHK bands like 0.10 do not leave float dust
+    # (e.g. 137.14 → 137.10, not 137.1000000002).
+    quant = Decimal(str(size))
+    stepped = (Decimal(str(raw)) / quant).quantize(Decimal("1"), rounding=ROUND_HALF_UP)
+    return float(stepped * quant)
 
 
 def lot_size_for(ticker: str, market: MarketId | str, *, fallback: int | None = None) -> int:

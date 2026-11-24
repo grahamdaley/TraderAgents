@@ -9,6 +9,7 @@ from trader.markets import (
     lot_size_for,
     parse_market,
     round_to_lot,
+    round_to_tick,
     tickers_match,
 )
 from trader.schemas import (
@@ -230,8 +231,9 @@ def build_trade_proposal(
         )
         raise PolicyRejection("Quantity is zero", checks)
 
-    limit_price = round(
-        reference_price * (1.001 if thesis.side == Side.BUY else 0.999), 2
+    limit_price = round_to_tick(
+        reference_price * (1.001 if thesis.side == Side.BUY else 0.999),
+        mid,
     )
     expires_at = utcnow() + timedelta(minutes=settings.proposal_ttl_minutes)
     proposal = TradeProposal(

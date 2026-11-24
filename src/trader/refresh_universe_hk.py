@@ -22,7 +22,7 @@ from trader.config import CONFIG_DIR
 # lot_size defaults are typical board lots; refresh may overwrite when known.
 SEED_ROWS: list[dict[str, str]] = [
     {"ticker": "0005.HK", "name": "HSBC HOLDINGS", "sector": "FINANCIALS", "lot_size": "400"},
-    {"ticker": "0011.HK", "name": "HANG SENG BANK", "sector": "FINANCIALS", "lot_size": "100"},
+    # 0011.HK (Hang Seng Bank) dropped: Yahoo no longer returns bars for it.
     {"ticker": "0388.HK", "name": "HKEX", "sector": "FINANCIALS", "lot_size": "100"},
     {"ticker": "0939.HK", "name": "CCB", "sector": "FINANCIALS", "lot_size": "1000"},
     {"ticker": "1398.HK", "name": "ICBC", "sector": "FINANCIALS", "lot_size": "1000"},

@@ -203,7 +203,11 @@ class MarketDataTools:
             symbols = {"^VIX": "vix", "^GSPC": "spx", "^TNX": "tnx"}
             index_symbol = "^GSPC"
         else:
-            symbols = {spec.regime_vol_symbol: "vix", spec.regime_index_symbol: "spx"}
+            # Only fetch symbols Yahoo still serves; VHSI is gone so vol is
+            # derived from the Hang Seng Index realized move below.
+            symbols = {spec.regime_index_symbol: "spx"}
+            if spec.regime_vol_symbol:
+                symbols[spec.regime_vol_symbol] = "vix"
             index_symbol = spec.regime_index_symbol
         values: dict[str, float | None] = {}
         for symbol, key in symbols.items():
@@ -217,11 +221,22 @@ class MarketDataTools:
                 values[key] = None
         index_hist = yf.Ticker(index_symbol).history(period="3mo")
         index_1m = None
-        if not index_hist.empty and len(index_hist) >= 21:
-            closes = index_hist["Close"]
-            index_1m = _safe_float(closes.iloc[-1] / closes.iloc[-21] - 1)
+        realized_vol_pct = None
+        if not index_hist.empty:
+            closes = index_hist["Close"].dropna()
+            if len(closes) >= 21:
+                index_1m = _safe_float(closes.iloc[-1] / closes.iloc[-21] - 1)
+            rets = closes.pct_change().dropna()
+            if len(rets) >= 20:
+                realized_vol_pct = _safe_float(
+                    rets.tail(20).std() * (252**0.5) * 100.0
+                )
+        vix = values.get("vix")
+        if vix is None and realized_vol_pct is not None:
+            # VIX-like proxy so classify_regime keeps working for HK.
+            vix = realized_vol_pct
         return {
-            "vix": values.get("vix"),
+            "vix": vix,
             "spx": values.get("spx"),
             "tnx": values.get("tnx") if mid == "us" else None,
             "spx_1m_return": index_1m,

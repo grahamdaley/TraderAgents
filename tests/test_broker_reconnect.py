@@ -44,3 +44,16 @@ def test_connect_lock_is_reentrant_for_disconnect_cleanup():
     with adapter._connect_lock:
         # Same-thread nested acquire is what _start_ib_thread hits via disconnect().
         adapter.disconnect()
+
+
+def test_client_id_rotates_within_window():
+    from trader.config import Settings
+
+    adapter = IBKRAdapter.__new__(IBKRAdapter)
+    adapter.settings = Settings.model_construct(ibkr_client_id=7)
+    adapter._client_id_offset = 0
+    assert adapter._next_client_id() == 7
+    adapter._client_id_offset = 1
+    assert adapter._next_client_id() == 8
+    adapter._client_id_offset = 5
+    assert adapter._next_client_id() == 7

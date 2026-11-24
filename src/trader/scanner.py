@@ -513,11 +513,13 @@ def run_scan(
 
     symbols = [row["ticker"] for row in universe]
     index_symbol = spec.regime_index_symbol
-    vol_symbol = spec.regime_vol_symbol
+    vol_symbol = (spec.regime_vol_symbol or "").strip()
     if mid == "us":
         extra = [*SECTOR_ETFS, index_symbol]
     else:
-        extra = [index_symbol, vol_symbol]
+        extra = [index_symbol]
+        if vol_symbol:
+            extra.append(vol_symbol)
     bars = download_bars(symbols + extra)
     macro = macro if macro is not None else tools.get_macro_snapshot(market=mid)
     regime = classify_regime(macro.get("vix"), macro.get("spx_1m_return"))

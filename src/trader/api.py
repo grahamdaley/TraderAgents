@@ -61,16 +61,16 @@ async def lifespan(app: FastAPI):
         await asyncio.to_thread(get_compiled_graph)
     except Exception as exc:  # noqa: BLE001
         logger.warning("Graph init warning: %s", exc)
-    review_task = asyncio.create_task(exit_review_loop())
-    fill_task = asyncio.create_task(fill_reconcile_loop())
-    autopilot_task = asyncio.create_task(autopilot_loop())
+    review_task = asyncio.create_task(exit_review_loop(), name="exit-review-loop")
+    fill_task = asyncio.create_task(fill_reconcile_loop(), name="fill-reconcile-loop")
+    autopilot_task = asyncio.create_task(autopilot_loop(), name="autopilot-loop")
+    background = (review_task, fill_task, autopilot_task)
     yield
-    for task in (review_task, fill_task, autopilot_task):
+    for task in background:
         task.cancel()
-        try:
-            await task
-        except asyncio.CancelledError:
-            pass
+    # Gather together so nested awaitables settle before the loop closes;
+    # cancelling one-by-one left orphaned tasks → "Task was destroyed…".
+    await asyncio.gather(*background, return_exceptions=True)
 
 
 app = FastAPI(title="Research Desk", version="0.1.0", lifespan=lifespan)
